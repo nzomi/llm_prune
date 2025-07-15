@@ -1,6 +1,4 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
-
 import shutil
 import copy
 import torch
@@ -8,6 +6,8 @@ import torch.nn as nn
 import random
 import argparse
 from icecream import ic
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import *
 from loader import *
@@ -28,11 +28,11 @@ def get_random_images(img_path, img_num, seed=None):
 
 def get_pixel_data(img_path, nsamples):
     pixel_data = []
-    image_list = get_random_images(img_path + '/calib', nsamples, seed=42)
+    image_list = get_random_images(img_path, nsamples, seed=42)
     for img in image_list:
         if img.endswith(('.png', '.jpg', '.jpeg')):
             # print(f"Processing {img}")
-            pixel_values = load_image(os.path.join(img_path + '/calib', img)).to(torch.bfloat16).cuda()
+            pixel_values = load_image(os.path.join(img_path, img)).to(torch.bfloat16).cuda()
             pixel_data.append(pixel_values)
     return pixel_data
 
@@ -134,7 +134,7 @@ def prune_sequential(args, layers, inputs):
             W_mask = (torch.zeros_like(imp) == 1)
 
             for sub_layer in sub_layers:
-                print(f'Prunning {i}.{sub_layer}')
+                # print(f'Prunning {i}.{sub_layer}') 
                 sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
                 indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 W_mask.scatter_(0, indice, True)
@@ -239,14 +239,14 @@ def main():
     parser.add_argument('--hook_type', type=str, default='prefill')
     parser.add_argument('--prune_type', type=str, default='sequential')
     parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent'])
-    parser.add_argument('--structure_prune', action='store_true')
-    parser.add_argument('--prune_ratio', type=int, default=1, choice=[1,2,3,4,5])
+    parser.add_argument('--prune_ratio', type=int, default=1)
+    parser.add_argument('--nsamples', type=int, default=30)
     parser.add_argument('--save_path', type=str, default='./')
     args = parser.parse_args()
-
-    args.get_entropy = False
-    args.nsamples = 30
     
+    args.structure_prune = True
+    args.get_entropy = False
+
     keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
 
@@ -257,6 +257,7 @@ def main():
 
     copy_all_files('/data/base_model/base2B', dst_dir=args.save_path)
     model.save_pretrained(args.save_path)
+    print(f"Pruned model saved to {args.save_path}")
 
 def debug():
     prompt_type = 'base'
@@ -273,9 +274,9 @@ def debug():
     args.structure_prune = True
     args.get_entropy = False
     args.prune_ratio = 1
-    args.nsamples = 30
+    args.nsamples = 100
 
-    save_path = f'./{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}'
+    save_path = f'./prune/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}'
     
     keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
@@ -287,10 +288,11 @@ def debug():
 
     copy_all_files('/data/base_model/base2B', dst_dir=save_path)
     model.save_pretrained(save_path)
+    print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    debug()
-
+    # debug()
+    main()
 
 
 
