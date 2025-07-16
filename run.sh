@@ -4,17 +4,17 @@ cuda_device=0
 export CUDA_VISIBLE_DEVICES=$cuda_device
 
 
-save_path_root='./prune'
+save_path_root='/data/prune/1'
 hook_type='prefill'
 prune_type='sequential'
 method='wanda'
-prune_ratios=(1 2 3 4 5)
-nsamples=(10 30 50 100 200)
+prune_ratios=(1 2 3)
+nsamples=(10 30 50 70 100 150 200 300)
 
 run_python_command () {
     local prune_ratio=$1
     local nsamples=$2
-    local save_path="${save_path_root}/${hook_type}_${prune_type}_r${prune_ratio}"
+    local save_path="${save_path_root}/${hook_type}_${prune_type}_r${prune_ratio}_n${nsamples}"
 
     echo ">>> Running: prune_ratio=${prune_ratio}0%, method=${method}, nsamples=${nsamples}"
 
