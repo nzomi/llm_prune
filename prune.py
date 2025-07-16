@@ -90,7 +90,6 @@ def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt)
         return prune_parrallel(args, llm_layer, inputs)
 
 def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt):
-    entropy = None
     keep_indices = []
     llm_layers = model.language_model.model.layers
     wrapped_layers = defaultdict(dict)
@@ -123,11 +122,11 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
         h.remove()
 
 
-    entropy = []
-    if args.get_entropy:
+    entropy = [None] * len(llm_layers)
+    if args.method in ['entropy', 'magent', 'esparse']:
         for i, layers in tqdm(enumerate(llm_layers)):
             wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
-            entropy.append(wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde())
+            entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde()
 
     if args.structure_prune:
         for i, layers in tqdm(enumerate(llm_layers)):
@@ -138,11 +137,10 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
                 x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
 
                 if args.method == 'entropy':
-                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i])
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha/10)
                     continue
-
-                if args.method in ['weight', 'wanda', 'esparse', 'magent']:
-                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha) # (1, in)                 
+                else:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha/10) # (1, in)                 
 
             W_mask = (torch.zeros_like(imp) == 1)
 
@@ -245,7 +243,7 @@ def prune_sequential(args, layers, inputs):
         for h in handles:
             h.remove()
 
-        if args.get_entropy:
+        if args.method in ['entropy', 'magent', 'esparse']:
             wrapped_layers['mlp.down_proj'].prepare_for_hist()
             handles = []
             handles.append(sub_layers['mlp.down_proj'].register_forward_hook(hook_io('mlp.down_proj')))
@@ -267,8 +265,8 @@ def prune_sequential(args, layers, inputs):
                     imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy)
                     continue
 
-                if args.method in ['weight', 'wanda', 'esparse', 'magent']:
-                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy, args.alpha) # (1, in)                 
+                if args.method in ['weight', 'wanda', 'esparse', 'magent', 'group_wanda']:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy, args.alpha/10) # (1, in)                 
 
             W_mask = (torch.zeros_like(imp) == 1)
 
@@ -291,6 +289,8 @@ def prune_sequential(args, layers, inputs):
             with torch.no_grad():
                 for j in range(len(inputs)):
                     inputs[j]['hidden_states'] = layer(**inputs[j])[0]
+        else:
+            pass
     
     torch.cuda.empty_cache()
 
@@ -377,14 +377,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hook_type', type=str, default='prefill')
     parser.add_argument('--prune_type', type=str, default='sequential')
-    parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent'])
+    parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent', 'group_wanda'])
     parser.add_argument('--prune_ratio', type=int, default=1)
     parser.add_argument('--nsamples', type=int, default=30)
     parser.add_argument('--save_path', type=str, default='./')
+    parser.add_argument('--alpha', type=int, default=1)
     args = parser.parse_args()
     
     args.structure_prune = True
-    args.get_entropy = False
 
     keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
@@ -410,16 +410,17 @@ def debug():
     # args.hook_type = 'prefill'
     args.hook_type = 'generate'
     args.prune_type = 'sequential'
-    args.method = 'entropy'
+    args.method = 'group_wanda'
     args.structure_prune = True
-    args.get_entropy = True
     args.prune_ratio = 1
     args.nsamples = 30
-    args.alpha = 0.9
+    args.alpha = 9
 
-    assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent']
+    assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda']
 
-    save_path = f'./prune/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}'
+    print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
+
+    save_path = f'/data/prune/1/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}'
     
     keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
@@ -434,8 +435,8 @@ def debug():
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    debug()
-    # main()
+    # debug()
+    main()
 
 
 
