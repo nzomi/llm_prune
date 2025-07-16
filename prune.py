@@ -1,5 +1,7 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import shutil
+from tqdm import tqdm
 import copy
 import torch
 import torch.nn as nn
@@ -7,6 +9,7 @@ import random
 import argparse
 from icecream import ic
 import warnings
+from collections import defaultdict
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import *
@@ -86,13 +89,84 @@ def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt)
     else:
         return prune_parrallel(args, llm_layer, inputs)
 
-def prune_generate(args, layers, inputs):
-    pass
+def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt):
+    entropy = None
+    keep_indices = []
+    llm_layers = model.language_model.model.layers
+    wrapped_layers = defaultdict(dict)
+    for i, layers in enumerate(llm_layers):
+        sub_layers = find_sub_layers(layers)
+        for sub_layer in sub_layers:
+            wrapped_layers[i][sub_layer] = WrappedLayer(sub_layers[sub_layer], i, sub_layer)
 
-def prune_parrallel(args, layrs, inputs):
-    pass
+    def hook_io(i, sub_layer):
+        def tmp(_, input, output):
+            if input[0].shape[1] == 1:
+                wrapped_layers[i][sub_layer].add_batch(input[0].data, output.data)
+        return tmp
 
-def prune_sequential(args, layers, inputs):
+    handles = []
+
+    for i, layers in enumerate(llm_layers):
+        sub_layers = find_sub_layers(layers)
+        for sub_layer in sub_layers:
+            handles.append(sub_layers[sub_layer].register_forward_hook(hook_io(i, sub_layer)))
+
+    with torch.no_grad():
+        for pixel_values in tqdm(pixel_data):
+            try:
+                model.chat(tokenizer, pixel_values, prompt, generation_config)
+            except:
+                continue
+
+    for h in handles:
+        h.remove()
+
+
+    entropy = []
+    if args.get_entropy:
+        for i, layers in tqdm(enumerate(llm_layers)):
+            wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
+            entropy.append(wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde())
+
+    if args.structure_prune:
+        for i, layers in tqdm(enumerate(llm_layers)):
+            sub_layers = find_sub_layers(layers)
+            imp = 0
+            for sub_layer in sub_layers:
+                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+
+                if args.method == 'entropy':
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i])
+                    continue
+
+                if args.method in ['weight', 'wanda', 'esparse', 'magent']:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha) # (1, in)                 
+
+            W_mask = (torch.zeros_like(imp) == 1)
+
+            for sub_layer in sub_layers:
+                # print(f'Prunning {i}.{sub_layer}') 
+                sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+                indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+                W_mask.scatter_(0, indice, True)
+                if 'up' in sub_layer or 'gate' in sub_layer:
+                    sub_layers[sub_layer].weight.data[W_mask,:]=0
+                elif 'down' in sub_layer:
+                    sub_layers[sub_layer].weight.data[:,W_mask]=0
+                else:
+                    raise ValueError
+
+            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
+
+            del imp, weights, x_norm_l2, sort_res, indice, W_mask
+    
+    torch.cuda.empty_cache()
+
+    return keep_indices
+
+def prune_parrallel(args, layers, inputs):
     keep_indices = []
     for i in range(len(layers)):
         layer = layers[i]
@@ -130,6 +204,71 @@ def prune_sequential(args, layers, inputs):
                 x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
 
                 imp += get_importance(args.method, weights, x_norm_l2, sub_layer) # (out, in)
+
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+
+            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
+
+            del imp, weights, x_norm_l2, sort_res
+    
+    torch.cuda.empty_cache()
+
+    return keep_indices
+
+def prune_sequential(args, layers, inputs):
+    entropy = None
+    keep_indices = []
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        sub_layers = find_sub_layers(layer)
+
+        wrapped_layers = {}
+        for sub_layer in sub_layers:
+            wrapped_layers[sub_layer] = WrappedLayer(sub_layers[sub_layer])
+
+        def hook_io(sub_layer):
+            def tmp(_, input, output):
+                wrapped_layers[sub_layer].add_batch(input[0].data, output.data)
+            return tmp
+
+        handles = []
+
+        for sub_layer in wrapped_layers:
+            handles.append(sub_layers[sub_layer].register_forward_hook(hook_io(sub_layer)))
+
+        with torch.no_grad():
+            for s in range(len(inputs)):
+                inputs[s].pop('i', None)
+                _ = layer(**inputs[s])[0]
+
+        for h in handles:
+            h.remove()
+
+        if args.get_entropy:
+            wrapped_layers['mlp.down_proj'].prepare_for_hist()
+            handles = []
+            handles.append(sub_layers['mlp.down_proj'].register_forward_hook(hook_io('mlp.down_proj')))
+            with torch.no_grad():
+                for s in tqdm(range(len(inputs))):
+                    _ = layer(**inputs[s])[0]
+            for h in handles:
+                h.remove()
+
+            entropy = wrapped_layers['mlp.down_proj'].calculate_entropy()
+
+        imp = 0
+        if args.structure_prune:
+            for sub_layer in sub_layers:
+                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+
+                if args.method == 'entropy':
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy)
+                    continue
+
+                if args.method in ['weight', 'wanda', 'esparse', 'magent']:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy, args.alpha) # (1, in)                 
 
             W_mask = (torch.zeros_like(imp) == 1)
 
@@ -268,13 +407,17 @@ def debug():
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
-    args.hook_type = 'prefill'
+    # args.hook_type = 'prefill'
+    args.hook_type = 'generate'
     args.prune_type = 'sequential'
-    args.method = 'wanda'
+    args.method = 'entropy'
     args.structure_prune = True
-    args.get_entropy = False
+    args.get_entropy = True
     args.prune_ratio = 1
-    args.nsamples = 100
+    args.nsamples = 30
+    args.alpha = 0.9
+
+    assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent']
 
     save_path = f'./prune/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}'
     
@@ -291,8 +434,8 @@ def debug():
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    # debug()
-    main()
+    debug()
+    # main()
 
 
 
