@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from torchprofile import profile_macs
+import numpy as np
+from matplotlib import pyplot as plt
 
 def get_model_macs(model, inputs) -> int:
     return profile_macs(model, inputs)
@@ -54,3 +56,85 @@ def norm_value(val, type='min_max'):
     else:
         raise ValueError
     return norm_val
+
+def plot_wanda_ent(wanda, ent, layer_idx, wanda_idx=None, ent_idx=None, mag_ent_idx=None, pr=0, a=0):
+    """
+    Scatter: x=wanda, y=ent.
+    Highlight wanda_idx (red), ent_idx (blue), base points gray.
+
+    Args:
+        wanda: 1D torch.Tensor or np.ndarray (already normalized).
+        ent:   1D torch.Tensor or np.ndarray (already normalized; same length as wanda).
+        wanda_idx: indices to highlight in red.  int | seq[int] | torch.Tensor | np.ndarray | None
+        ent_idx:   indices to highlight in blue. int | seq[int] | torch.Tensor | np.ndarray | None
+        title: optional str.
+        figsize: tuple.
+
+    Returns:
+        (fig, ax) matplotlib figure and axes.
+    """
+
+    # ---- to numpy ----
+    def _to_np(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        else:
+            x = np.asarray(x)
+        return x
+
+    wanda = _to_np(wanda).reshape(-1)
+    ent   = _to_np(ent).reshape(-1)
+    wanda_idx = _to_np(wanda_idx)
+    ent_idx = _to_np(ent_idx)
+    mag_ent_idx = _to_np(mag_ent_idx)
+    assert wanda.shape == ent.shape, "wanda and ent must be same length."
+    n = wanda.shape[0]
+
+    wanda_idx = np.asarray(wanda_idx, dtype=int).ravel() if wanda_idx is not None else []
+    ent_idx   = np.asarray(ent_idx, dtype=int).ravel() if ent_idx is not None else []
+    mag_ent_idx = np.asarray(mag_ent_idx, dtype=int).ravel() if mag_ent_idx is not None else []
+
+    mask_all = np.ones(n, dtype=bool)
+    mask_all[:] = True
+
+    mask_wanda = np.zeros(n, dtype=bool)
+    mask_wanda[wanda_idx] = True
+
+    mask_ent = np.zeros(n, dtype=bool)
+    mask_ent[ent_idx] = True
+    
+    mask_mag_ent = np.zeros(n, dtype=bool)
+    mask_mag_ent[mag_ent_idx] = True
+
+    # ---- plot ----
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    ax.scatter(wanda[~(mask_wanda | mask_ent | mask_mag_ent)], 
+               ent[~(mask_wanda | mask_ent | mask_mag_ent)], 
+               s=10, c='#999999', alpha=0.1, label='Unpruned Neurons')
+
+    # magnitude 
+    if mask_wanda.any():
+        ax.scatter(wanda[mask_wanda], ent[mask_wanda], 
+                   s=12, c='#FF7F0E', alpha=0.2, label='Pruned by Magnitude')
+
+    # entropy 
+    if mask_ent.any():
+        ax.scatter(wanda[mask_ent], ent[mask_ent], 
+                   s=15, c='#1F77B4', alpha=0.3, label='Pruned by Entropy')
+
+    # magent 
+    if mask_mag_ent.any():
+        ax.scatter(wanda[mask_mag_ent], ent[mask_mag_ent], 
+                   s=20, c='#2CA02C', alpha=0.5, label='Pruned by Magent')
+
+    ax.set_xlabel('Magnitude Score')
+    ax.set_ylabel('Entropy Score')
+    ax.set_title(f'Magnitude vs Entropy Distribution for Layer {layer_idx}', fontsize=14)
+
+    ax.legend(loc='best', frameon=False)
+    ax.grid(alpha=0.3)
+
+    fig.savefig(f"img/{pr}/magent_db_l{layer_idx}_a{a}.png", dpi=300, bbox_inches='tight')
+
+    plt.close()

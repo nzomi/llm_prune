@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import shutil
 from tqdm import tqdm
 import copy
@@ -91,6 +91,7 @@ def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt)
 
 def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt):
     keep_indices = []
+    prune_indices = []
     llm_layers = model.language_model.model.layers
     wrapped_layers = defaultdict(dict)
     for i, layers in enumerate(llm_layers):
@@ -132,22 +133,38 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
         for i, layers in tqdm(enumerate(llm_layers)):
             sub_layers = find_sub_layers(layers)
             imp = 0
+            wanda = 0
             for sub_layer in sub_layers:
                 weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
                 x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-
+                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                
                 if args.method == 'entropy':
-                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha/10)
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
                     continue
                 else:
-                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], args.alpha/10) # (1, in)                 
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
+
+            wanda = norm_value(wanda)
+
+            if args.method == 'magent':
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])               
 
             W_mask = (torch.zeros_like(imp) == 1)
 
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+
+            if args.plot_wanda_ent and args.method == 'magent':
+                sort_wanda = torch.sort(wanda, dim=0, stable=True)
+                sort_ent = torch.sort(norm_value(entropy[i]), dim=0, stable=True)
+                indice_wanda = sort_wanda.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+                indice_ent = sort_ent.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+                plot_wanda_ent(wanda, norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
+
+            prune_indices.append(indice)
             for sub_layer in sub_layers:
                 # print(f'Prunning {i}.{sub_layer}') 
-                sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
-                indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 W_mask.scatter_(0, indice, True)
                 if 'up' in sub_layer or 'gate' in sub_layer:
                     sub_layers[sub_layer].weight.data[W_mask,:]=0
@@ -162,7 +179,7 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
     
     torch.cuda.empty_cache()
 
-    return keep_indices
+    return keep_indices, prune_indices
 
 def prune_parrallel(args, layers, inputs):
     keep_indices = []
@@ -216,6 +233,7 @@ def prune_parrallel(args, layers, inputs):
 def prune_sequential(args, layers, inputs):
     entropy = None
     keep_indices = []
+    prune_indices = []
 
     for i in range(len(layers)):
         layer = layers[i]
@@ -270,10 +288,11 @@ def prune_sequential(args, layers, inputs):
 
             W_mask = (torch.zeros_like(imp) == 1)
 
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+            prune_indices.append(indice)
             for sub_layer in sub_layers:
                 # print(f'Prunning {i}.{sub_layer}') 
-                sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
-                indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 W_mask.scatter_(0, indice, True)
                 if 'up' in sub_layer or 'gate' in sub_layer:
                     sub_layers[sub_layer].weight.data[W_mask,:]=0
@@ -294,7 +313,7 @@ def prune_sequential(args, layers, inputs):
     
     torch.cuda.empty_cache()
 
-    return keep_indices
+    return keep_indices, prune_indices
 
 def prune_linear_channel(linear_layer, selected_idx, prune_channel):
     if prune_channel == 1:
@@ -377,16 +396,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hook_type', type=str, default='prefill')
     parser.add_argument('--prune_type', type=str, default='sequential')
-    parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent', 'group_wanda'])
+    parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent', 'group_wanda', 'norm_group_wanda'])
     parser.add_argument('--prune_ratio', type=int, default=1)
     parser.add_argument('--nsamples', type=int, default=30)
-    parser.add_argument('--save_path', type=str, default='./')
     parser.add_argument('--alpha', type=int, default=1)
+    parser.add_argument('--save_path', type=str, default='./')
     args = parser.parse_args()
     
     args.structure_prune = True
+    args.plot_wanda_ent = True
 
-    keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
+    keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
 
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
@@ -410,11 +430,12 @@ def debug():
     # args.hook_type = 'prefill'
     args.hook_type = 'generate'
     args.prune_type = 'sequential'
-    args.method = 'group_wanda'
+    args.method = 'magent'
     args.structure_prune = True
     args.prune_ratio = 1
     args.nsamples = 30
     args.alpha = 9
+    args.plot_wanda_ent = True
 
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda']
 
@@ -422,7 +443,9 @@ def debug():
 
     save_path = f'/data/prune/1/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}'
     
-    keep_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
+    keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
+    # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
+
     prune_model = apply_channel_prune(model, keep_indices)
 
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)

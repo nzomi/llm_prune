@@ -1,19 +1,20 @@
 #!/bin/bash
 
-cuda_device=0
+cuda_device=1
 export CUDA_VISIBLE_DEVICES=$cuda_device
 
 
-save_path_root='/data/prune/1'
-hook_type='generate'
+save_path_root='/data/prune/3'
+hook_type='prefill'
 prune_type='sequential'
 # prune_type='generate'
 methods1=('wanda' 'group_wanda' 'entropy')
 methods2=('magent' 'esparse')
-prune_ratios=(1 2 3)
+methods3=('weight')
+prune_ratios=(1 2)
 nsamples=(30)
 alphas1=(0)
-alphas2=(1 2 3 4 5 6 7 8 9)
+alphas2=(9)
 
 run_python_command () {
     local prune_ratio=$1
@@ -30,22 +31,31 @@ run_python_command () {
         --prune_type $prune_type \
         --method $method \
         --nsamples $nsamples \
+        --alpha $alpha \
         --save_path $save_path"
 
     eval $cmd
 }
 
-for method in "${methods1[@]}"; do
+# for method in "${methods2[@]}"; do
+#     for prune_ratio in "${prune_ratios[@]}"; do
+#         for alpha in "${alphas2[@]}"; do
+#             run_python_command "$prune_ratio" "$method" "$nsamples" "$alpha"
+#         done
+#     done
+# done
+
+# for method in "${methods1[@]}"; do
+#     for prune_ratio in "${prune_ratios[@]}"; do
+#         for alpha in "${alphas1[@]}"; do
+#             run_python_command "$prune_ratio" "$method" "$nsamples" "$alpha"
+#         done
+#     done
+# done
+
+for method in "${methods3[@]}"; do
     for prune_ratio in "${prune_ratios[@]}"; do
         for alpha in "${alphas1[@]}"; do
-            run_python_command "$prune_ratio" "$method" "$nsamples" "$alpha"
-        done
-    done
-done
-
-for method in "${methods2[@]}"; do
-    for prune_ratio in "${prune_ratios[@]}"; do
-        for alpha in "${alphas2[@]}"; do
             run_python_command "$prune_ratio" "$method" "$nsamples" "$alpha"
         done
     done
