@@ -1,5 +1,5 @@
 import os
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import shutil
 from tqdm import tqdm
 import copy
@@ -70,6 +70,49 @@ def prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt
 
     return inputs
 
+def prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation_config, prompt):
+    llm_layers = model.language_model.model.layers
+    
+    captured_data = {}
+
+    class GenerationCatcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.attention_type = module.attention_type
+            self.sample_idx = -1
+
+        def forward(self, inp, **kwargs):
+            seq_len = inp.shape[1]
+            
+            if self.sample_idx not in captured_data:
+                captured_data[self.sample_idx] = {'prefill': None, 'decode': []}
+                cache = {}
+                cache['hidden_states'] = inp.cpu() 
+                cache['position_ids'] = kwargs['position_ids'].cpu()
+                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                captured_data[self.sample_idx]['prefill'] = cache
+            else:
+                cache = {}
+                cache['hidden_states'] = inp.cpu()
+                cache['position_ids'] = kwargs['position_ids'].cpu()
+                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                captured_data[self.sample_idx]['decode'].append(cache)
+
+            return self.module(inp, **kwargs)
+
+    original_layer = llm_layers[0]
+    catcher_module = GenerationCatcher(original_layer)
+    llm_layers[0] = catcher_module
+
+    for i, pixel_values in enumerate(pixel_data):
+        catcher_module.sample_idx = i 
+        model.chat(tokenizer, pixel_values, prompt, generation_config)
+
+    llm_layers[0] = original_layer
+
+    return captured_data
+
 def prune(args, model, tokenizer, generation_config, img_path, prompt):
     pixel_data = get_pixel_data(img_path, args.nsamples)
     if args.hook_type == 'prefill':
@@ -81,7 +124,9 @@ def prune(args, model, tokenizer, generation_config, img_path, prompt):
             
 def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt):
     with torch.no_grad():
-        inputs = prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt)
+        # inputs = prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt)
+        inputs = prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation_config, prompt)
+
 
     llm_layer = model.language_model.model.layers
     if args.prune_type == 'sequential':
@@ -124,7 +169,7 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
 
 
     entropy = [None] * len(llm_layers)
-    if args.method in ['entropy', 'magent', 'esparse']:
+    if args.method in ['entropy', 'magent', 'esparse', 'test']:
         for i, layers in tqdm(enumerate(llm_layers)):
             wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
             entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde()
@@ -145,10 +190,13 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
                 else:
                     imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
 
-            wanda = norm_value(wanda)
+            # wanda = norm_value(wanda)
 
             if args.method == 'magent':
-                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])               
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])            
+
+            if args.method == 'test':
+                imp = wanda * norm_value(entropy[i])    
 
             W_mask = (torch.zeros_like(imp) == 1)
 
@@ -272,19 +320,28 @@ def prune_sequential(args, layers, inputs):
                 h.remove()
 
             entropy = wrapped_layers['mlp.down_proj'].calculate_entropy()
+            sub_layers = find_sub_layers(layers)
+            imp = 0
+            wanda = 0
 
         imp = 0
+        wanda = 0
         if args.structure_prune:
             for sub_layer in sub_layers:
                 weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-
+                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                
                 if args.method == 'entropy':
-                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy)
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
                     continue
+                else:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
 
-                if args.method in ['weight', 'wanda', 'esparse', 'magent', 'group_wanda']:
-                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy, args.alpha/10) # (1, in)                 
+            wanda = norm_value(wanda)
+
+            if args.method == 'magent':
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])                
 
             W_mask = (torch.zeros_like(imp) == 1)
 
@@ -415,7 +472,7 @@ def main():
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
     copy_all_files('/data/base_model/base2B', dst_dir=args.save_path)
-    model.save_pretrained(args.save_path)
+    prune_model.save_pretrained(args.save_path)
     print(f"Pruned model saved to {args.save_path}")
 
 def debug():
@@ -427,21 +484,21 @@ def debug():
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
-    # args.hook_type = 'prefill'
-    args.hook_type = 'generate'
+    args.hook_type = 'prefill'
+    # args.hook_type = 'generate'
     args.prune_type = 'sequential'
-    args.method = 'magent'
+    args.method = 'wanda'
     args.structure_prune = True
-    args.prune_ratio = 1
-    args.nsamples = 30
+    args.prune_ratio = 2
+    args.nsamples = 1
     args.alpha = 9
-    args.plot_wanda_ent = True
+    args.plot_wanda_ent = False
 
-    assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda']
+    assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda', 'test']
 
     print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
 
-    save_path = f'/data/prune/1/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}'
+    save_path = f'/data/prune/3/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}'
     
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
@@ -454,12 +511,12 @@ def debug():
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
     copy_all_files('/data/base_model/base2B', dst_dir=save_path)
-    model.save_pretrained(save_path)
+    prune_model.save_pretrained(save_path)
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    # debug()
-    main()
+    debug()
+    # main()
 
 
 

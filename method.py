@@ -9,6 +9,7 @@ def get_importance(method, sub_layer, weight, x_norm_l2, entropy=None, alpha=0):
         'esparse': get_esparse_imp,
         'magent': get_magent_imp,
         'abnorm_group_wanda': get_norm_group_wanda_imp,
+        'test': get_magent_imp,
     }
     return imp_fn.get(method)(sub_layer, weight, x_norm_l2, entropy, alpha)
 
