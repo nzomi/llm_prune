@@ -80,10 +80,20 @@ class WrappedLayer:
         tmp = input.shape[1] # (sample_num,)
  
         if self.layer_name == 'mlp.down_proj':
-            self.input_matrix[:, self.nsamples] = input.squeeze(1) # (channel, )
+            # 确保input_matrix有足够的空间存储数据
+            if self.nsamples < self.input_matrix.shape[1]:
+                if tmp == 1:  # model.chat()
+                    self.input_matrix[:, self.nsamples] = input.squeeze(1) # (channel, )
+                else:  # model.generate()
+                    # last token
+                    self.input_matrix[:, self.nsamples] = input[:, -1] # (channel, )
 
         self.x_norm_l2 *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
+        # 对于mlp.down_proj层，只在成功存储数据时增加nsamples
+        if self.layer_name == 'mlp.down_proj' and self.nsamples < self.input_matrix.shape[1]:
+            self.nsamples += 1  # 每次只增加1，因为我们只存储一个token的数据
+        else:
+            self.nsamples += tmp  # 其他层保持原有逻辑
 
         input = input.type(torch.float32)
         self.x_norm_l1 += torch.norm(input, p=1, dim=1) / self.nsamples

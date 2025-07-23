@@ -1,7 +1,7 @@
 import torch
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoModel, AutoTokenizer, AutoConfig, AutoModelForCausalLM
 import torchvision.transforms as T
 import yaml
 import math
@@ -107,13 +107,21 @@ def split_model(model_path):
     return device_map
 
 def load_model_tokenizer(path):
-    device_map = split_model(path)
-    model = AutoModel.from_pretrained(
+    # device_map = split_model(path)
+    # model = AutoModel.from_pretrained(
+    #     path,
+    #     torch_dtype=torch.bfloat16,
+    #     load_in_8bit=False,
+    #     low_cpu_mem_usage=True,
+    #     use_flash_attn=False,
+    #     trust_remote_code=True,
+    #     device_map='auto').eval()
+    # tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
+    model = AutoModelForCausalLM.from_pretrained(
         path,
         torch_dtype=torch.bfloat16,
         load_in_8bit=False,
         low_cpu_mem_usage=True,
-        use_flash_attn=False,
         trust_remote_code=True,
         device_map='auto').eval()
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
