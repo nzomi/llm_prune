@@ -1,5 +1,5 @@
 import os
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import shutil
 from tqdm import tqdm
 import copy
@@ -9,6 +9,7 @@ import random
 import argparse
 from icecream import ic
 import warnings
+import json
 from collections import defaultdict
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -39,10 +40,25 @@ def get_pixel_data(img_path, nsamples):
             pixel_data.append(pixel_values)
     return pixel_data
 
-def prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt):
-    llm_layers = model.language_model.model.layers
+def get_llm_layers(model, model_type='vlm'):
+    """根据模型类型获取正确的模型层"""
+    if model_type == 'llm':
+        return model.model.layers
+    else:  # vlm
+        return model.language_model.model.layers
+
+def get_llm_data(data_path, nsamples):
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if isinstance(data, dict) and 'data' in data:
+        data = data['data']
+    random.shuffle(data)
+    return [item['instruction'] for item in data[:nsamples]]
+
+def prepare_calib_inputs(model, tokenizer, data, generation_config, prompt, model_type='vlm'):
+    llm_layers = get_llm_layers(model, model_type)
     cache = {'i':0, 'position_ids':None, 'attention_mask':None, 'position_embeddings':None}
-    inputs = [None]*len(pixel_data)
+    inputs = [None]*len(data)
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -58,41 +74,57 @@ def prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt
             cache['i'] += 1
             raise ValueError("Hooked and stopped forward")
 
-    llm_layers[0] = Catcher(llm_layers[0]) # wrap for hook first llm_layer input
+    llm_layers[0] = Catcher(llm_layers[0])
 
-    for pixel_values in pixel_data:
+    for item in data:
         try:
-            model.chat(tokenizer, pixel_values, prompt, generation_config)
+            if model_type == 'vlm':
+                pixel_values = item
+                if hasattr(model, 'chat'):
+                    model.chat(tokenizer, pixel_values, prompt, generation_config)
+                else:
+                    input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(model.device)
+                    model.generate(input_ids, images=pixel_values, **generation_config)
+            else:
+                text_prompt = item
+                if hasattr(model, 'chat'):
+                    model.chat(tokenizer, None, text_prompt, generation_config)
+                else:
+                    input_ids = tokenizer(text_prompt, return_tensors='pt').input_ids.to(model.device)
+                    model.generate(input_ids, **generation_config)
         except ValueError:
             continue  
 
-    llm_layers[0] = llm_layers[0].module  # turn to original layer
+    llm_layers[0] = llm_layers[0].module
 
     return inputs
 
-def prune(args, model, tokenizer, generation_config, img_path, prompt):
-    pixel_data = get_pixel_data(img_path, args.nsamples)
+def prune(args, model, tokenizer, generation_config, data_path, prompt):
+    if args.model_type == 'vlm':
+        data = get_pixel_data(data_path, args.nsamples)
+    else:
+        data = get_llm_data(data_path, args.nsamples)
     if args.hook_type == 'prefill':
-        return prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt)
+        return prune_prefill(args, model, tokenizer, data, generation_config, prompt)
     elif args.hook_type == 'generate':
-        return prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt)
+        return prune_generate(args, model, tokenizer, data, generation_config, prompt)
     else:
         raise ValueError
             
-def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt):
+def prune_prefill(args, model, tokenizer, data, generation_config, prompt):
     with torch.no_grad():
-        inputs = prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt)
+        inputs = prepare_calib_inputs(model, tokenizer, data, generation_config, prompt, args.model_type)
 
-    llm_layer = model.language_model.model.layers
+    llm_layer = get_llm_layers(model, args.model_type)
     if args.prune_type == 'sequential':
         return prune_sequential(args, llm_layer, inputs)
     else:
         return prune_parrallel(args, llm_layer, inputs)
 
-def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt):
+def prune_generate(args, model, tokenizer, data, generation_config, prompt):
     keep_indices = []
     prune_indices = []
-    llm_layers = model.language_model.model.layers
+    llm_layers = get_llm_layers(model, args.model_type)
     wrapped_layers = defaultdict(dict)
     for i, layers in enumerate(llm_layers):
         sub_layers = find_sub_layers(layers)
@@ -113,9 +145,31 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
             handles.append(sub_layers[sub_layer].register_forward_hook(hook_io(i, sub_layer)))
 
     with torch.no_grad():
-        for pixel_values in tqdm(pixel_data):
+        for item in tqdm(data):
             try:
-                model.chat(tokenizer, pixel_values, prompt, generation_config)
+                if args.model_type == 'vlm':
+                    pixel_values = item
+                    if hasattr(model, 'chat'):
+                        model.chat(tokenizer, pixel_values, prompt, generation_config)
+                    else:
+                        input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(model.device)
+                        model.generate(input_ids, images=pixel_values, **generation_config)
+                else:
+                    text_prompt = item
+                    if hasattr(model, 'chat'):
+                        model.chat(tokenizer, None, text_prompt, generation_config)
+                    else:
+                        messages = [
+                                    {"role": "user", "content": text_prompt}
+                                ]
+                        text = tokenizer.apply_chat_template(
+                                messages,
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+                        # input_ids = tokenizer(text_prompt, return_tensors='pt').input_ids.to(model.device)
+                        model.generate(**model_inputs, max_new_tokens=1024)
             except:
                 continue
 
@@ -123,48 +177,59 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
         h.remove()
 
 
-    entropy = [None] * len(llm_layers)
-    if args.method in ['entropy', 'magent', 'esparse']:
-        for i, layers in tqdm(enumerate(llm_layers)):
-            wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
-            entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde()
-
     if args.structure_prune:
+        entropy = [None] * len(llm_layers)
+        if args.method in ['entropy', 'magent', 'esparse']:
+            for i, layers in tqdm(enumerate(llm_layers)):
+                wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
+                entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde()
+        if args.wanda_mode == 'global':
+            all_wandas = []
+            for i, layers in tqdm(enumerate(llm_layers)):
+                sub_layers = find_sub_layers(layers)
+                layer_wanda = 0
+                for sub_layer in sub_layers:
+                    weights = torch.abs(sub_layers[sub_layer].weight.data)
+                    x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1)))
+                    layer_wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                all_wandas.append(layer_wanda)
+            concatenated_wandas = torch.cat(all_wandas, dim=0)
+            normalized_wandas = norm_value(concatenated_wandas)
+            split_normalized_wandas = torch.split(normalized_wandas, [w.shape[0] for w in all_wandas], dim=0)
+            global_wandas = split_normalized_wandas
         for i, layers in tqdm(enumerate(llm_layers)):
             sub_layers = find_sub_layers(layers)
             imp = 0
             wanda = 0
+            if args.wanda_mode == 'global':
+                wanda = global_wandas[i]
+            else:
+                for sub_layer in sub_layers:
+                    weights = torch.abs(sub_layers[sub_layer].weight.data)
+                    x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1)))
+                    wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                wanda = norm_value(wanda)
             for sub_layer in sub_layers:
-                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
-                
+                weights = torch.abs(sub_layers[sub_layer].weight.data)
+                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1)))
                 if args.method == 'entropy':
                     imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
                     continue
                 else:
-                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
-
-            wanda = norm_value(wanda)
-
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
             if args.method == 'magent':
-                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])               
-
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])
             W_mask = (torch.zeros_like(imp) == 1)
-
-            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            sort_res = torch.sort(imp, dim=0, stable=True)
             indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
-
             if args.plot_wanda_ent and args.method == 'magent':
                 sort_wanda = torch.sort(wanda, dim=0, stable=True)
                 sort_ent = torch.sort(norm_value(entropy[i]), dim=0, stable=True)
                 indice_wanda = sort_wanda.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 indice_ent = sort_ent.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 plot_wanda_ent(wanda, norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
-
             prune_indices.append(indice)
             for sub_layer in sub_layers:
-                # print(f'Prunning {i}.{sub_layer}') 
                 W_mask.scatter_(0, indice, True)
                 if 'up' in sub_layer or 'gate' in sub_layer:
                     sub_layers[sub_layer].weight.data[W_mask,:]=0
@@ -172,9 +237,7 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
                     sub_layers[sub_layer].weight.data[:,W_mask]=0
                 else:
                     raise ValueError
-
             keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
-
             del imp, weights, x_norm_l2, sort_res, indice, W_mask
     
     torch.cuda.empty_cache()
@@ -336,12 +399,13 @@ def prune_linear_channel(linear_layer, selected_idx, prune_channel):
     return new_linear
 
 @torch.no_grad()
-def apply_channel_prune(model, idx):
+def apply_channel_prune(model, idx, model_type='vlm'):
     model = copy.deepcopy(model)  
     all_down_linears = []
     all_up_linears = []
     all_gate_linears = []
-    for i, decoder_layer in enumerate(model.language_model.model.layers):
+    llm_layers = get_llm_layers(model, model_type)
+    for i, decoder_layer in enumerate(llm_layers):
         for name, module in decoder_layer.named_modules():
             if isinstance(module, nn.Linear) and 'down' in name:
                 all_down_linears.append((f"layer.{i}.{name}", module))
@@ -362,9 +426,9 @@ def apply_channel_prune(model, idx):
             new_down_linear = prune_linear_channel(cur_down_linear, idx[i_linear].to(model.device), 1)
             new_gate_linear = prune_linear_channel(cur_gate_linear, idx[i_linear].to(model.device), 0)
             new_up_linear = prune_linear_channel(cur_up_linear, idx[i_linear].to(model.device), 0)
-            model.language_model.model.layers[i_linear].mlp.down_proj = new_down_linear
-            model.language_model.model.layers[i_linear].mlp.gate_proj = new_gate_linear
-            model.language_model.model.layers[i_linear].mlp.up_proj = new_up_linear
+            llm_layers[i_linear].mlp.down_proj = new_down_linear
+            llm_layers[i_linear].mlp.gate_proj = new_gate_linear
+            llm_layers[i_linear].mlp.up_proj = new_up_linear
 
     return model
 
@@ -394,6 +458,7 @@ def main():
     img_path = '/data/Dataset/filtered/tagbar'
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--wanda_mode', type=str, default='local', choices=['local', 'global'])
     parser.add_argument('--hook_type', type=str, default='prefill')
     parser.add_argument('--prune_type', type=str, default='sequential')
     parser.add_argument('--method', type=str, default='wanda', choices=['wanda', 'weight', 'esparse', 'entropy', 'magent', 'group_wanda', 'norm_group_wanda'])
@@ -405,9 +470,10 @@ def main():
     
     args.structure_prune = True
     args.plot_wanda_ent = True
+    args.model_type = 'vlm'  # main函数默认使用vlm模式
 
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
-    prune_model = apply_channel_prune(model, keep_indices)
+    prune_model = apply_channel_prune(model, keep_indices, 'vlm')
 
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
@@ -427,26 +493,33 @@ def debug():
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
-    # args.hook_type = 'prefill'
+    args.wanda_mode = 'local'
     args.hook_type = 'generate'
     args.prune_type = 'sequential'
     args.method = 'magent'
     args.structure_prune = True
-    args.prune_ratio = 1
-    args.nsamples = 30
+    args.prune_ratio = 2
+    args.nsamples = 20
     args.alpha = 9
-    args.plot_wanda_ent = True
-
+    args.plot_wanda_ent = False
+    args.model_type = 'vlm'
+    args.data_path = '/data/zige.wang/data/alpaca_data_cleaned.json'
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda']
 
     print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
 
-    save_path = f'/data/prune/1/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}'
+    save_path = f'/data/zige.wang/0723_test_sample/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_{args.wanda_mode}_n{args.nsamples}'
     
-    keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
+    # 根据model_type选择正确的数据路径
+    if args.model_type == 'llm':
+        data_path = args.data_path
+    else:
+        data_path = img_path
+    
+    keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, data_path, prompt)
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
 
-    prune_model = apply_channel_prune(model, keep_indices)
+    prune_model = apply_channel_prune(model, keep_indices, args.model_type)
 
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
@@ -454,12 +527,10 @@ def debug():
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
     copy_all_files('/data/base_model/base2B', dst_dir=save_path)
-    model.save_pretrained(save_path)
+    prune_model.save_pretrained(save_path)
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    # debug()
-    main()
-
-
-
+    debug()
+    # main()
+    
