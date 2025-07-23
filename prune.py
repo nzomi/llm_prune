@@ -39,38 +39,7 @@ def get_pixel_data(img_path, nsamples):
             pixel_data.append(pixel_values)
     return pixel_data
 
-def prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt):
-    llm_layers = model.language_model.model.layers
-    cache = {'i':0, 'position_ids':None, 'attention_mask':None, 'position_embeddings':None}
-    inputs = [None]*len(pixel_data)
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-            self.attention_type = module.attention_type
-        def forward(self, inp, **kwargs):
-            cache['hidden_states'] = inp
-            cache['position_ids'] = kwargs['position_ids']
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_embeddings'] = kwargs['position_embeddings']
-            inputs[cache['i']] = copy.deepcopy(cache)
-            cache['i'] += 1
-            raise ValueError("Hooked and stopped forward")
-
-    llm_layers[0] = Catcher(llm_layers[0]) # wrap for hook first llm_layer input
-
-    for pixel_values in pixel_data:
-        try:
-            model.chat(tokenizer, pixel_values, prompt, generation_config)
-        except ValueError:
-            continue  
-
-    llm_layers[0] = llm_layers[0].module  # turn to original layer
-
-    return inputs
-
-def prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation_config, prompt):
+def prepare_calib_inputs(args, model, tokenizer, pixel_data, generation_config, prompt):
     llm_layers = model.language_model.model.layers
     
     captured_data = {}
@@ -83,31 +52,39 @@ def prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation
             self.sample_idx = -1
 
         def forward(self, inp, **kwargs):
-            seq_len = inp.shape[1]
-            
             if self.sample_idx not in captured_data:
-                captured_data[self.sample_idx] = {'prefill': None, 'decode': []}
-                cache = {}
-                cache['hidden_states'] = inp.cpu() 
-                cache['position_ids'] = kwargs['position_ids'].cpu()
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
+                captured_data[self.sample_idx] = {'prefill': None, 'generate': []}
+                cache = copy.deepcopy(kwargs)
+                cache['hidden_states'] = inp
                 captured_data[self.sample_idx]['prefill'] = cache
+                if args.hook_type == 'prefill':
+                    raise ValueError("Hooked and stopped forward for prefill")
             else:
-                cache = {}
-                cache['hidden_states'] = inp.cpu()
-                cache['position_ids'] = kwargs['position_ids'].cpu()
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                captured_data[self.sample_idx]['decode'].append(cache)
+                cache = copy.deepcopy(kwargs)
+                cache['hidden_states'] = inp
+                captured_data[self.sample_idx]['generate'].append(cache)
 
             return self.module(inp, **kwargs)
 
     original_layer = llm_layers[0]
     catcher_module = GenerationCatcher(original_layer)
+    catcher_module.mlp = original_layer.mlp
     llm_layers[0] = catcher_module
+
+    act = {}
+    def hook_act(_, input, output):
+        if catcher_module.sample_idx not in act:
+            act[catcher_module.sample_idx] = defaultdict(list)
+        act[catcher_module.sample_idx]['input'].append(input)
+        act[catcher_module.sample_idx]['output'].append(output)
+    catcher_module.mlp.down_proj.register_forward_hook(hook_act)
 
     for i, pixel_values in enumerate(pixel_data):
         catcher_module.sample_idx = i 
-        model.chat(tokenizer, pixel_values, prompt, generation_config)
+        try:
+            model.chat(tokenizer, pixel_values, prompt, generation_config)
+        except:
+            pass
 
     llm_layers[0] = original_layer
 
@@ -115,26 +92,21 @@ def prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation
 
 def prune(args, model, tokenizer, generation_config, img_path, prompt):
     pixel_data = get_pixel_data(img_path, args.nsamples)
-    if args.hook_type == 'prefill':
-        return prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt)
-    elif args.hook_type == 'generate':
-        return prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt)
+    if args.prune_type == 'sequential':
+        return prune_sequential(args, model, tokenizer, pixel_data, generation_config, prompt)
+    elif args.prune_type == 'parrallel':
+        return _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prompt)
     else:
         raise ValueError
             
-def prune_prefill(args, model, tokenizer, pixel_data, generation_config, prompt):
+def prune_sequential(args, model, tokenizer, pixel_data, generation_config, prompt):
     with torch.no_grad():
-        # inputs = prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt)
-        inputs = prepare_calib_inputs_for_generation(model, tokenizer, pixel_data, generation_config, prompt)
-
+        inputs = prepare_calib_inputs(args, model, tokenizer, pixel_data, generation_config, prompt)
 
     llm_layer = model.language_model.model.layers
-    if args.prune_type == 'sequential':
-        return prune_sequential(args, llm_layer, inputs)
-    else:
-        return prune_parrallel(args, llm_layer, inputs)
+    _prune_sequential(args, llm_layer, inputs)
 
-def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt):
+def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prompt):
     keep_indices = []
     prune_indices = []
     llm_layers = model.language_model.model.layers
@@ -146,6 +118,8 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
 
     def hook_io(i, sub_layer):
         def tmp(_, input, output):
+            if i == 0 and sub_layer == 'mlp.down_proj':
+                print(f"Hook called for layer {i}/{sub_layer}. Input shape: {input[0].shape}")
             if input[0].shape[1] == 1:
                 wrapped_layers[i][sub_layer].add_batch(input[0].data, output.data)
         return tmp
@@ -161,12 +135,16 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
         for pixel_values in tqdm(pixel_data):
             try:
                 model.chat(tokenizer, pixel_values, prompt, generation_config)
+            # except Exception as e:
+            #         print(f"An error occurred: {e}")
+            #         import traceback
+            #         traceback.print_exc()
+            #         continue
             except:
                 continue
 
     for h in handles:
         h.remove()
-
 
     entropy = [None] * len(llm_layers)
     if args.method in ['entropy', 'magent', 'esparse', 'test']:
@@ -229,56 +207,7 @@ def prune_generate(args, model, tokenizer, pixel_data, generation_config, prompt
 
     return keep_indices, prune_indices
 
-def prune_parrallel(args, layers, inputs):
-    keep_indices = []
-    for i in range(len(layers)):
-        layer = layers[i]
-        sub_layers = find_sub_layers(layer)
-
-        wrapped_layers = {}
-        for sub_layer in sub_layers:
-            wrapped_layers[sub_layer] = WrappedLayer(sub_layers[sub_layer])
-
-        def hook_io(sub_layer):
-            def tmp(_, input, output):
-                wrapped_layers[sub_layer].get_data(input[0].data, output.data)
-            return tmp
-
-        handles = []
-
-        for sub_layer in wrapped_layers:
-            handles.append(sub_layers[sub_layer].register_forward_hook(hook_io(sub_layer)))
-
-        with torch.no_grad():
-            for s in range(len(inputs)):
-                inputs[s].pop('i', None)
-                _ = layer(**inputs[s])[0]
-
-        for h in handles:
-            h.remove()
-
-        if args.get_entropy:
-            pass
-
-        imp = 0
-        if args.structure_prune:
-            for sub_layer in sub_layers:
-                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-
-                imp += get_importance(args.method, weights, x_norm_l2, sub_layer) # (out, in)
-
-            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
-
-            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
-
-            del imp, weights, x_norm_l2, sort_res
-    
-    torch.cuda.empty_cache()
-
-    return keep_indices
-
-def prune_sequential(args, layers, inputs):
+def _prune_sequential(args, layers, inputs):
     entropy = None
     keep_indices = []
     prune_indices = []
@@ -289,7 +218,7 @@ def prune_sequential(args, layers, inputs):
 
         wrapped_layers = {}
         for sub_layer in sub_layers:
-            wrapped_layers[sub_layer] = WrappedLayer(sub_layers[sub_layer])
+            wrapped_layers[sub_layer] = WrappedLayer(sub_layers[sub_layer], total_sample=args.nsamples)
 
         def hook_io(sub_layer):
             def tmp(_, input, output):
@@ -303,14 +232,20 @@ def prune_sequential(args, layers, inputs):
 
         with torch.no_grad():
             for s in range(len(inputs)):
-                inputs[s].pop('i', None)
-                _ = layer(**inputs[s])[0]
+                if args.hook_type == 'prefill':
+                    _ = layer(**inputs[s]['prefill'])[0]
+                elif args.hook_type == 'generate':
+                    # n = len(inputs[s]['generate'])
+                    _ = layer(**inputs[s]['generate'][0])[0]
 
         for h in handles:
             h.remove()
 
         if args.method in ['entropy', 'magent', 'esparse']:
-            wrapped_layers['mlp.down_proj'].prepare_for_hist()
+            if args.hook_type == 'prefill':
+                wrapped_layers['mlp.down_proj'].prepare_for_hist()
+            elif args.hook_type == 'generate':
+                wrapped_layers['mlp.down_proj'].prepare_for_kde()
             handles = []
             handles.append(sub_layers['mlp.down_proj'].register_forward_hook(hook_io('mlp.down_proj')))
             with torch.no_grad():
@@ -318,18 +253,17 @@ def prune_sequential(args, layers, inputs):
                     _ = layer(**inputs[s])[0]
             for h in handles:
                 h.remove()
-
-            entropy = wrapped_layers['mlp.down_proj'].calculate_entropy()
-            sub_layers = find_sub_layers(layers)
-            imp = 0
-            wanda = 0
+            if args.hook_type == 'prefill':
+                entropy = wrapped_layers['mlp.down_proj'].calculate_entropy()
+            elif args.hook_type == 'generate':
+                entropy = wrapped_layers['mlp.down_proj'].calculate_entropy_kde()
 
         imp = 0
         wanda = 0
         if args.structure_prune:
             for sub_layer in sub_layers:
                 weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
                 wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
                 
                 if args.method == 'entropy':
@@ -364,9 +298,52 @@ def prune_sequential(args, layers, inputs):
 
             with torch.no_grad():
                 for j in range(len(inputs)):
-                    inputs[j]['hidden_states'] = layer(**inputs[j])[0]
+                    if args.hook_type == 'prefill':
+                        inputs[j]['hidden_states'] = layer(**inputs[j]['prefill'])[0]
+                    elif args.hook_type == 'generate':
+                        inputs[j]['hidden_states'][-1] = layer(**inputs[j]['generate'][-1])[0]
         else:
-            pass
+            for sub_layer in sub_layers:
+                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                
+                if args.method == 'entropy':
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                    continue
+                else:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
+
+            wanda = norm_value(wanda)
+
+            if args.method == 'magent':
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])                
+
+            W_mask = (torch.zeros_like(imp) == 1)
+
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+            prune_indices.append(indice)
+            for sub_layer in sub_layers:
+                # print(f'Prunning {i}.{sub_layer}') 
+                W_mask.scatter_(0, indice, True)
+                if 'up' in sub_layer or 'gate' in sub_layer:
+                    sub_layers[sub_layer].weight.data[W_mask,:]=0
+                elif 'down' in sub_layer:
+                    sub_layers[sub_layer].weight.data[:,W_mask]=0
+                else:
+                    raise ValueError
+
+            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
+
+            del imp, weights, x_norm_l2, sort_res, indice, W_mask
+
+            with torch.no_grad():
+                for j in range(len(inputs)):
+                    if args.hook_type == 'prefill':
+                        inputs[j]['hidden_states'] = layer(**inputs[j]['prefill'])[0]
+                    elif args.hook_type == 'generate':
+                        inputs[j]['hidden_states'][-1] = layer(**inputs[j]['generate'][-1])[0]
     
     torch.cuda.empty_cache()
 
@@ -484,13 +461,14 @@ def debug():
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
-    args.hook_type = 'prefill'
-    # args.hook_type = 'generate'
-    args.prune_type = 'sequential'
+    # args.hook_type = 'prefill'
+    args.hook_type = 'generate'
+    # args.prune_type = 'sequential'
+    args.prune_type = 'parrallel'
     args.method = 'wanda'
     args.structure_prune = True
     args.prune_ratio = 2
-    args.nsamples = 1
+    args.nsamples = 30
     args.alpha = 9
     args.plot_wanda_ent = False
 
