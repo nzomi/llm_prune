@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from scipy.stats import gaussian_kde
 
-def find_layers(module, layers=[nn.Linear], name='', prune='mlp'):
+def find_layers(module, layers=[nn.Linear], name='', prune='feed_forward'):
     """
     Recursively find the layers of a certain type in a module.
 
@@ -24,7 +24,7 @@ def find_layers(module, layers=[nn.Linear], name='', prune='mlp'):
         ))
     return res
 
-def find_sub_layers(module, layers=[nn.Linear], name='', prune_layer='mlp'):
+def find_sub_layers(module, layers=[nn.Linear], name='', prune_layer='feed_forward'):
     if type(module) in layers and prune_layer in name:
         return {name: module}
     res = {}
@@ -81,7 +81,7 @@ class WrappedLayer:
         self.input = input
         tmp = input.shape[1] # (sample_num,)
  
-        if self.layer_name == 'mlp.down_proj':
+        if self.layer_name == 'feed_forward.w2':
             self.input_list.append(input.squeeze(1))
             self.input_matrix[:, self.nsamples] = input.squeeze(1) # (channel, )
 

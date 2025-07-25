@@ -14,8 +14,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import *
 from loader import *
-from method import *
-from wrapper import *
+from method9B import *
+from wrapper9B import *
 
 Byte = 8
 KiB = 1024 * Byte
@@ -129,8 +129,8 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
     entropy = [None] * len(llm_layers)
     if args.method in ['entropy', 'magent', 'esparse', 'test']:
         for i, layers in tqdm(enumerate(llm_layers)):
-            wrapped_layers[i]['mlp.down_proj'].prepare_for_kde()
-            entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde_total()
+            wrapped_layers[i]['feed_forward.w2'].prepare_for_kde()
+            entropy[i] = wrapped_layers[i]['feed_forward.w2'].calculate_entropy_kde_total()
             # entropy[i] = wrapped_layers[i]['mlp.down_proj'].calculate_entropy_kde()
 
     if args.structure_prune:
@@ -173,9 +173,9 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             for sub_layer in sub_layers:
                 # print(f'Prunning {i}.{sub_layer}') 
                 W_mask.scatter_(0, indice, True)
-                if 'up' in sub_layer or 'gate' in sub_layer:
+                if 'w3' in sub_layer or 'w1' in sub_layer:
                     sub_layers[sub_layer].weight.data[W_mask,:]=0
-                elif 'down' in sub_layer:
+                elif 'w2' in sub_layer:
                     sub_layers[sub_layer].weight.data[:,W_mask]=0
                 else:
                     raise ValueError
@@ -310,12 +310,12 @@ def apply_channel_prune(model, idx):
     all_gate_linears = []
     for i, decoder_layer in enumerate(model.language_model.model.layers):
         for name, module in decoder_layer.named_modules():
-            if isinstance(module, nn.Linear) and 'down' in name:
-                all_down_linears.append((f"layer.{i}.{name}", module))
-            elif isinstance(module, nn.Linear) and  'up' in name:
-                all_up_linears.append((f"layer.{i}.{name}", module))
-            elif isinstance(module, nn.Linear) and  'gate' in name:
-                all_gate_linears.append((f"layer.{i}.{name}", module))
+            if isinstance(module, nn.Linear) and 'w2' in name:
+                all_down_linears.append((f"feed_forward.{i}.{name}", module))
+            elif isinstance(module, nn.Linear) and  'w1' in name:
+                all_up_linears.append((f"feed_forward.{i}.{name}", module))
+            elif isinstance(module, nn.Linear) and  'w3' in name:
+                all_gate_linears.append((f"feed_forward.{i}.{name}", module))
             else:
                 continue
 
@@ -329,9 +329,9 @@ def apply_channel_prune(model, idx):
             new_down_linear = prune_linear_channel(cur_down_linear, idx[i_linear].to(model.device), 1)
             new_gate_linear = prune_linear_channel(cur_gate_linear, idx[i_linear].to(model.device), 0)
             new_up_linear = prune_linear_channel(cur_up_linear, idx[i_linear].to(model.device), 0)
-            model.language_model.model.layers[i_linear].mlp.down_proj = new_down_linear
-            model.language_model.model.layers[i_linear].mlp.gate_proj = new_gate_linear
-            model.language_model.model.layers[i_linear].mlp.up_proj = new_up_linear
+            model.language_model.model.layers[i_linear].feed_forward.w2 = new_down_linear
+            model.language_model.model.layers[i_linear].feed_forward.w3 = new_gate_linear
+            model.language_model.model.layers[i_linear].feed_forward.w1 = new_up_linear
 
     return model
 
@@ -399,13 +399,13 @@ def debug():
     args.hook_type = 'generate'
     args.prune_type = 'sequential'
     args.prune_type = 'parrallel'
-    args.method = 'group_wanda'
+    args.method = 'entropy'
     args.structure_prune = True
     args.prune_ratio = 5
     args.nsamples = 32
     args.alpha = 9
     args.plot_wanda_ent = False
-    args.kde_nsamples = 60
+    args.kde_nsamples = 40
 
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda', 'test']
 
@@ -429,12 +429,12 @@ def debug():
     prune_model_params = get_num_parameters(model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
-    copy_all_files('/data/base_model/base2B', dst_dir=save_path)
+    copy_all_files('/data/base_model/base9B', dst_dir=save_path)
     if not args.structure_prune:
         model.save_pretrained(save_path)
     else:
         prune_model.save_pretrained(save_path)
-        ic(prune_model.language_model.model.layers[0].mlp)
+        ic(prune_model.language_model.model.layers[0].feed_forward)
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
