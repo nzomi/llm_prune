@@ -107,32 +107,32 @@ def plot_wanda_ent(wanda, ent, layer_idx, wanda_idx=None, ent_idx=None, mag_ent_
     mask_mag_ent[mag_ent_idx] = True
 
     # ---- plot ----
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=300)
 
     ax.scatter(wanda[~(mask_wanda | mask_ent | mask_mag_ent)], 
                ent[~(mask_wanda | mask_ent | mask_mag_ent)], 
-               s=10, c='#999999', alpha=0.1, label='Unpruned Neurons')
+               s=10, c='#999999', alpha=0.5, label='Unpruned Neurons', marker='o')
 
     # magnitude 
     if mask_wanda.any():
-        ax.scatter(wanda[mask_wanda], ent[mask_wanda], 
-                   s=12, c='#FF7F0E', alpha=0.2, label='Pruned by Magnitude')
+        ax.scatter(wanda[mask_wanda], ent[mask_wanda], marker='s', 
+                   s=10, c='#FF7F0E', alpha=0.7, label='Pruned by Magnitude')
 
     # entropy 
     if mask_ent.any():
-        ax.scatter(wanda[mask_ent], ent[mask_ent], 
-                   s=15, c='#1F77B4', alpha=0.3, label='Pruned by Entropy')
+        ax.scatter(wanda[mask_ent], ent[mask_ent], marker='^',
+                   s=10, c='#1F77B4', alpha=0.7, label='Pruned by Entropy')
 
     # magent 
     if mask_mag_ent.any():
-        ax.scatter(wanda[mask_mag_ent], ent[mask_mag_ent], 
-                   s=20, c='#2CA02C', alpha=0.5, label='Pruned by Magent')
+        ax.scatter(wanda[mask_mag_ent], ent[mask_mag_ent], marker='v',
+                   s=10, c='#2CA02C', alpha=0.8, label='Pruned by Magent')
 
-    ax.set_xlabel('Magnitude Score')
-    ax.set_ylabel('Entropy Score')
-    ax.set_title(f'Magnitude vs Entropy Distribution for Layer {layer_idx}', fontsize=14)
+    ax.set_xlabel('Magnitude Score', fontsize=9)
+    ax.set_ylabel('Entropy Score', fontsize=9)
+    ax.set_title(f'Magnitude vs Entropy Distribution for InternVL3-2B Layer {layer_idx}', fontsize=9)
 
-    ax.legend(loc='best', frameon=False)
+    ax.legend(loc='best', frameon=False, fontsize=9)
     ax.grid(alpha=0.3)
 
     fig.savefig(f"img/{pr}/magent_db_l{layer_idx}_a{a}.png", dpi=300, bbox_inches='tight')

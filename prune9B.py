@@ -13,7 +13,7 @@ from collections import defaultdict
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import *
-from loader import *
+from loader9B import *
 from method9B import *
 from wrapper9B import *
 
@@ -355,10 +355,10 @@ def copy_all_files(src_dir, dst_dir):
 
 def main():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
-    prompt = load_prompt('/data/template.yaml', prompt_type)
-    generation_config = dict(max_new_tokens=1024, do_sample=False)
-    img_path = '/data/Dataset/filtered/tagbar'
+    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
+    prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
+    generation_config = dict(max_new_tokens=256, do_sample=False)
+    img_path = '/data/Dataset/filtered/structural_le'
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--hook_type', type=str, default='prefill')
@@ -371,17 +371,19 @@ def main():
     args = parser.parse_args()
     
     args.structure_prune = True
-    args.plot_wanda_ent = True
+    args.plot_wanda_ent = False
+    args.kde_nsamples = 60
 
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
 
+    prune_model.config.llm_config.intermediate_size = prune_model.language_model.model.layers[0].feed_forward.w2.in_features
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
     prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
-    copy_all_files('/data/base_model/base2B', dst_dir=args.save_path)
+    copy_all_files('/data/base_model/base9B', dst_dir=args.save_path)
     prune_model.save_pretrained(args.save_path)
     print(f"Pruned model saved to {args.save_path}")
 
@@ -389,9 +391,9 @@ def debug():
     prompt_type = 'base'
     # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
     model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
-    prompt = load_prompt('/data/template.yaml', prompt_type)
+    prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
     generation_config = dict(max_new_tokens=256, do_sample=False)
-    img_path = '/data/Dataset/filtered/tagbar'
+    img_path = '/data/Dataset/filtered/structural_le'
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
@@ -402,10 +404,10 @@ def debug():
     args.method = 'entropy'
     args.structure_prune = True
     args.prune_ratio = 5
-    args.nsamples = 32
+    args.nsamples = 30
     args.alpha = 9
     args.plot_wanda_ent = False
-    args.kde_nsamples = 40
+    args.kde_nsamples = 60
 
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda', 'test']
 
@@ -423,7 +425,7 @@ def debug():
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
 
    
-
+    prune_model.config.llm_config.intermediate_size = prune_model.language_model.model.layers[0].feed_forward.w2.in_features
     prune_model_size = get_model_size(model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
     prune_model_params = get_num_parameters(model, count_nonzero_only=True)
@@ -438,8 +440,8 @@ def debug():
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    debug()
-    # main()
+    # debug()
+    main()
 
 
 

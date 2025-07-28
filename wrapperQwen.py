@@ -48,8 +48,8 @@ class WrappedLayer:
 
         self.min_vals = torch.full((self.cols,), float('inf'), device=self.dev)
         self.max_vals = torch.full((self.cols,), float('-inf'), device=self.dev)
-        self.activation_histograms = torch.zeros((self.cols, self.num_bins), device=self.dev)
-        self.input_matrix = torch.zeros((self.cols, total_sample), device=self.dev)
+        # self.activation_histograms = torch.zeros((self.cols, self.num_bins), device=self.dev)
+        # self.input_matrix = torch.zeros((self.cols, total_sample), device=self.dev)
         self.input_list = []
 
         self.nsamples = 0
@@ -83,7 +83,7 @@ class WrappedLayer:
  
         if self.layer_name == 'mlp.down_proj':
             self.input_list.append(input.squeeze(1))
-            self.input_matrix[:, self.nsamples] = input.squeeze(1) # (channel, )
+            # self.input_matrix[:, self.nsamples] = input.squeeze(1) # (channel, )
 
         self.x_norm_l2 *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
@@ -95,48 +95,48 @@ class WrappedLayer:
         self.min_vals = torch.minimum(self.min_vals, torch.min(input, dim=1).values)
         self.max_vals = torch.maximum(self.max_vals, torch.max(input, dim=1).values)
 
-    def get_hist(self, input):
-        for i in range(self.cols):
-            clamped_inp_row = torch.clamp(input[i], self.min_vals[i], self.max_vals[i]).float()
-            hist = torch.histc(clamped_inp_row, bins=self.num_bins, min=self.min_vals[i], max=self.max_vals[i])
-            self.activation_histograms[i] += hist
+    # def get_hist(self, input):
+    #     for i in range(self.cols):
+    #         clamped_inp_row = torch.clamp(input[i], self.min_vals[i], self.max_vals[i]).float()
+    #         hist = torch.histc(clamped_inp_row, bins=self.num_bins, min=self.min_vals[i], max=self.max_vals[i])
+    #         self.activation_histograms[i] += hist
 
-    def prepare_for_hist(self):
-        self.mode = 'build_hist'
+    # def prepare_for_hist(self):
+    #     self.mode = 'build_hist'
 
     def prepare_for_kde(self):
         self.mode = 'build_kde'
 
-    def calculate_entropy(self, epsilon=1e-10):
-        if self.nsamples == 0:
-            return torch.zeros(self.cols, device=self.dev)
+    # def calculate_entropy(self, epsilon=1e-10):
+    #     if self.nsamples == 0:
+    #         return torch.zeros(self.cols, device=self.dev)
         
-        total_counts_per_channel = self.activation_histograms.sum(dim=1)
-        # Avoid division by zero for channels that never saw any activation
-        total_counts_per_channel[total_counts_per_channel == 0] = 1
+    #     total_counts_per_channel = self.activation_histograms.sum(dim=1)
+    #     # Avoid division by zero for channels that never saw any activation
+    #     total_counts_per_channel[total_counts_per_channel == 0] = 1
 
-        probs = self.activation_histograms / total_counts_per_channel.unsqueeze(1)
-        entropy = -torch.sum(probs * torch.log(probs + epsilon), dim=1)
-        return entropy
+    #     probs = self.activation_histograms / total_counts_per_channel.unsqueeze(1)
+    #     entropy = -torch.sum(probs * torch.log(probs + epsilon), dim=1)
+    #     return entropy
 
-    def calculate_entropy_kde(self):
-        c, m = self.input_matrix.shape
-        entropies = torch.zeros(c, device=self.dev)
+    # def calculate_entropy_kde(self):
+    #     c, m = self.input_matrix.shape
+    #     entropies = torch.zeros(c, device=self.dev)
 
-        def kde_entropy(values, num_points=100):
-            values_np = values.float().cpu().numpy()
-            kde = gaussian_kde(values_np)
-            xs = np.linspace(values_np.min(), values_np.max(), num_points)
-            probs = kde(xs)
-            probs /= probs.sum() + 1e-8  # normalize (not strictly necessary)
-            entropy = -np.sum(probs * np.log(probs + 1e-8)) * (xs[1] - xs[0]) * 1000
-            return torch.tensor(entropy, dtype=values.dtype, device=values.device)
+    #     def kde_entropy(values, num_points=100):
+    #         values_np = values.float().cpu().numpy()
+    #         kde = gaussian_kde(values_np)
+    #         xs = np.linspace(values_np.min(), values_np.max(), num_points)
+    #         probs = kde(xs)
+    #         probs /= probs.sum() + 1e-8  # normalize (not strictly necessary)
+    #         entropy = -np.sum(probs * np.log(probs + 1e-8)) * (xs[1] - xs[0]) * 1000
+    #         return torch.tensor(entropy, dtype=values.dtype, device=values.device)
 
-        for i in range(c):
-            values = self.input_matrix[i, :].abs().cpu()
-            entropy = kde_entropy(values)  # or hist_entropy(values, bins)
-            entropies[i] = entropy.to(self.dev)
-        return entropies
+    #     for i in range(c):
+    #         values = self.input_matrix[i, :].abs().cpu()
+    #         entropy = kde_entropy(values)  # or hist_entropy(values, bins)
+    #         entropies[i] = entropy.to(self.dev)
+    #     return entropies
     
     def calculate_entropy_kde_total(self):
         c = self.cols
@@ -152,10 +152,11 @@ class WrappedLayer:
             return torch.tensor(entropy, dtype=values.dtype, device=values.device)
 
         input_tensor = torch.stack(self.input_list)
-        # N = input_tensor.shape[0]
-        # indices = torch.randperm(N)[:self.kde_samples]
-        # subset = input_tensor[indices]
-        subset = input_tensor[:self.kde_samples]
+        N = input_tensor.shape[0]
+        # print(self.kde_samples, N)
+        indices = torch.randperm(N)[:self.kde_samples]
+        subset = input_tensor[indices]
+        # subset = input_tensor
         if self.layer_id == 0:
             print('ent tensor', subset.shape)
         for i in range(c):

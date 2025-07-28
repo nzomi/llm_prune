@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import shutil
 from tqdm import tqdm
 import copy
@@ -152,7 +152,7 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             # wanda = norm_value(wanda)
 
             if args.method == 'magent':
-                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])            
+                imp = (1-args.alpha/10) * norm_value(wanda) + args.alpha/10 * norm_value(entropy[i])            
 
             if args.method == 'test':
                 imp = wanda * norm_value(entropy[i])    
@@ -163,11 +163,11 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
 
             if args.plot_wanda_ent and args.method == 'magent':
-                sort_wanda = torch.sort(wanda, dim=0, stable=True)
+                sort_wanda = torch.sort(norm_value(wanda), dim=0, stable=True)
                 sort_ent = torch.sort(norm_value(entropy[i]), dim=0, stable=True)
                 indice_wanda = sort_wanda.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 indice_ent = sort_ent.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
-                plot_wanda_ent(wanda, norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
+                plot_wanda_ent(norm_value(wanda), norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
 
             prune_indices.append(indice)
             for sub_layer in sub_layers:
@@ -371,24 +371,25 @@ def main():
     args = parser.parse_args()
     
     args.structure_prune = True
-    args.plot_wanda_ent = True
+    args.plot_wanda_ent = False
+    args.kde_nsamples = 60
 
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
-
+    prune_model.config.llm_config.intermediate_size = prune_model.language_model.model.layers[0].mlp.down_proj.in_features
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
     prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
-
+    prune
     copy_all_files('/data/base_model/base2B', dst_dir=args.save_path)
     prune_model.save_pretrained(args.save_path)
     print(f"Pruned model saved to {args.save_path}")
 
 def debug():
     prompt_type = 'base'
-    # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
+    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
+    # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
     prompt = load_prompt('/data/template.yaml', prompt_type)
     generation_config = dict(max_new_tokens=256, do_sample=False)
     img_path = '/data/Dataset/filtered/tagbar'
@@ -396,15 +397,15 @@ def debug():
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
     args.hook_type = 'prefill'
-    args.hook_type = 'generate'
+    # args.hook_type = 'generate'
     args.prune_type = 'sequential'
-    args.prune_type = 'parrallel'
-    args.method = 'group_wanda'
-    args.structure_prune = True
-    args.prune_ratio = 5
+    # args.prune_type = 'parrallel'
+    args.method = 'wanda'
+    args.structure_prune = False
+    args.prune_ratio = 6
     args.nsamples = 32
-    args.alpha = 9
-    args.plot_wanda_ent = False
+    args.alpha = 8
+    args.plot_wanda_ent = True
     args.kde_nsamples = 60
 
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda', 'test']
@@ -412,12 +413,12 @@ def debug():
     print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
 
     if not args.structure_prune:
-        save_path = f'/data/prune/exp/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_uns'
+        save_path = f'/data/prune/internvl2B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_uns'
         prune(args, model, tokenizer, generation_config, img_path, prompt)
         
     else:
         # save_path = f'/data/prune/sample/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_s{args.nsamples}'
-        save_path = f'/data/prune/9B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_s{args.nsamples}_ka'
+        save_path = f'/data/prune/internvl2B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_s{args.nsamples}_k{args.kde_nsamples}'
         keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
         prune_model = apply_channel_prune(model, keep_indices)
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
@@ -438,8 +439,8 @@ def debug():
     print(f"Pruned model saved to {save_path}")
 
 if __name__ == "__main__":
-    debug()
-    # main()
+    # debug()
+    main()
 
 
 

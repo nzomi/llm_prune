@@ -1,3 +1,5 @@
 **__pycache__**
 prune/
 img/
+img_his/
+*.txt

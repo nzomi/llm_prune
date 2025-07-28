@@ -155,9 +155,9 @@ class WrappedLayer:
         # N = input_tensor.shape[0]
         # indices = torch.randperm(N)[:self.kde_samples]
         # subset = input_tensor[indices]
-        subset = input_tensor
+        subset = input_tensor[:self.kde_samples]
         if self.layer_id == 0:
-            print('ent tensor', subset.shape)
+            print('ent tensor', self.kde_samples, subset.shape)
         for i in range(c):
             values = subset[:, i].abs().cpu()
             entropy = kde_entropy(values)  # or hist_entropy(values, bins)

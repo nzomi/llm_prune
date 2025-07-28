@@ -444,7 +444,7 @@ def copy_all_files(args, src_dir, dst_dir):
 
 def main():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-1.7B')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-8B')
     prompt = load_prompt('/data/template.yaml', prompt_type)
     generation_config = dict(max_new_tokens=1024, do_sample=False)
     img_path = '/data/alpaca_data_cleaned.json'
@@ -471,13 +471,13 @@ def main():
     prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
-    copy_all_files(args, '/data/base_model/baseQwen3-1.7B', dst_dir=args.save_path)
+    copy_all_files(args, '/data/base_model/baseQwen3-8B', dst_dir=args.save_path)
     prune_model.save_pretrained(args.save_path)
     print(f"Pruned model saved to {args.save_path}")
 
 def debug():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-1.7B')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-8B')
     prompt = load_prompt('/data/template.yaml', prompt_type)
     generation_config = dict(max_new_tokens=1024, do_sample=False)
     img_path = '/data/Dataset/filtered/tagbar'
@@ -501,7 +501,7 @@ def debug():
 
     print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
 
-    save_path = f'/data/prune/Qwen3-1.7B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_n{args.nsamples}_a{args.alpha}_k{args.kde_nsamples}'
+    save_path = f'/data/prune/Qwen3-8B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_n{args.nsamples}_a{args.alpha}_k{args.kde_nsamples}'
     
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
@@ -513,7 +513,7 @@ def debug():
     prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
-    copy_all_files(args, '/data/base_model/baseQwen3-1.7B', dst_dir=save_path)
+    copy_all_files(args, '/data/base_model/baseQwen3-8B', dst_dir=save_path)
     prune_model.save_pretrained(save_path)
     print(f"Pruned model saved to {save_path}")
 if __name__ == "__main__":
