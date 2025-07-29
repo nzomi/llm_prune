@@ -10,14 +10,14 @@ hook_type='generate'
 prune_type='parrallel'
 methods1=('group_wanda' 'entropy' 'magent' 'esparse')
 prune_ratios=(5)
-nsamples=(30)
-alphas1=(9)
+nsamples=(128)
+alphas1=(1)
 
 
 run_python_command () {
     local prune_ratio=$1
     local method=$2
-    local nsamples=30
+    local nsamples=128
     local alpha=$3
     local save_path="${save_path_root}/${method}_${hook_type}_${prune_type}_r${prune_ratio}_n${nsample}_a${alpha}"
 

@@ -112,9 +112,9 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             handles.append(sub_layers[sub_layer].register_forward_hook(hook_io(i, sub_layer)))
 
     with torch.no_grad():
-        for pixel_values in tqdm(pixel_data):
+        for i, pixel_values in tqdm(enumerate(pixel_data)):
             try:
-                model.chat(tokenizer, pixel_values, prompt, generation_config)
+                model.chat(tokenizer, pixel_values, prompt[i]['messages'][0]['content'], generation_config)
             # except Exception as e:
             #         print(f"An error occurred: {e}")
             #         import traceback
@@ -355,10 +355,17 @@ def copy_all_files(src_dir, dst_dir):
 
 def main():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
-    prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
-    generation_config = dict(max_new_tokens=256, do_sample=False)
-    img_path = '/data/Dataset/filtered/structural_le'
+    # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Shanghai_AI_Laboratory/InternVL3-9B')
+    # prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
+    import json
+    prompt = []
+    with open('/data/zige.wang/data/vqa/en_processed.jsonl', 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():  # 跳过空行
+                prompt.append(json.loads(line))
+    generation_config = dict(max_new_tokens=128, do_sample=False)
+    img_path = '/data/zige.wang/data/vqa/extracted_images'
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--hook_type', type=str, default='prefill')
@@ -390,8 +397,15 @@ def main():
 def debug():
     prompt_type = 'base'
     # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
-    prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
+    # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Shanghai_AI_Laboratory/InternVL3-9B')
+    # prompt = load_prompt('/home/liyuan.jiang/workspace/dataset/config/table_superior/structural_le.yaml', prompt_type)
+    import json
+    prompt = []
+    with open('/data/zige.wang/data/vqa/en_processed.jsonl', 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():  # 跳过空行
+                prompt.append(json.loads(line))
     generation_config = dict(max_new_tokens=256, do_sample=False)
     img_path = '/data/Dataset/filtered/structural_le'
 

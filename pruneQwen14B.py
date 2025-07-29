@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import shutil
 from tqdm import tqdm
 import copy
@@ -13,9 +13,10 @@ from collections import defaultdict
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from utils import *
-from loader import *
+from loaderQwen import *
 from method import *
-from wrapper import *
+from wrapperQwen import *
+from lib.eval import eval_ppl
 
 Byte = 8
 KiB = 1024 * Byte
@@ -39,39 +40,70 @@ def get_pixel_data(img_path, nsamples):
             pixel_data.append(pixel_values)
     return pixel_data
 
-def prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt):
-    llm_layers = model.language_model.model.layers
-    cache = {'i':0, 'position_ids':None, 'attention_mask':None, 'position_embeddings':None}
-    inputs = [None]*len(pixel_data)
+def prepare_calib_inputs(args, model, tokenizer, pixel_data, generation_config, prompt):
+    llm_layers = model.model.layers
+    
+    captured_data = {}
 
-    class Catcher(nn.Module):
+    class GenerationCatcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
             self.attention_type = module.attention_type
+            self.sample_idx = -1
+
         def forward(self, inp, **kwargs):
-            cache['hidden_states'] = inp
-            cache['position_ids'] = kwargs['position_ids']
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_embeddings'] = kwargs['position_embeddings']
-            inputs[cache['i']] = copy.deepcopy(cache)
-            cache['i'] += 1
-            raise ValueError("Hooked and stopped forward")
+            if self.sample_idx not in captured_data:
+                captured_data[self.sample_idx] = {'prefill': None, 'generate': []}
+                cache = copy.deepcopy(kwargs)
+                cache['hidden_states'] = inp
+                captured_data[self.sample_idx]['prefill'] = cache
+                if args.hook_type == 'prefill':
+                    raise ValueError("Hooked and stopped forward for prefill")
+            else:
+                cache = copy.deepcopy(kwargs)
+                cache['hidden_states'] = inp
+                captured_data[self.sample_idx]['generate'].append(cache)
 
-    llm_layers[0] = Catcher(llm_layers[0]) # wrap for hook first llm_layer input
+            return self.module(inp, **kwargs)
 
-    for pixel_values in pixel_data:
+    original_layer = llm_layers[0]
+    catcher_module = GenerationCatcher(original_layer)
+    catcher_module.mlp = original_layer.mlp
+    llm_layers[0] = catcher_module
+
+    act = {}
+    def hook_act(_, input, output):
+        if catcher_module.sample_idx not in act:
+            act[catcher_module.sample_idx] = defaultdict(list)
+        act[catcher_module.sample_idx]['input'].append(input)
+        act[catcher_module.sample_idx]['output'].append(output)
+    catcher_module.mlp.down_proj.register_forward_hook(hook_act)
+
+    for i, pixel_values in enumerate(pixel_data):
+        catcher_module.sample_idx = i 
         try:
             model.chat(tokenizer, pixel_values, prompt, generation_config)
-        except ValueError:
-            continue  
+        except:
+            pass
 
-    llm_layers[0] = llm_layers[0].module  # turn to original layer
+    llm_layers[0] = original_layer
 
-    return inputs
+    return captured_data
+
+import json
+def get_llm_data(data_path, nsamples):
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if isinstance(data, dict) and 'data' in data:
+        data = data['data']
+    random.shuffle(data)
+    return [item['instruction'] for item in data[:nsamples]]
 
 def prune(args, model, tokenizer, generation_config, img_path, prompt):
-    pixel_data = get_pixel_data(img_path, args.nsamples)
+    # pixel_data = get_pixel_data(img_path, args.nsamples)
+    pixel_data = get_llm_data(img_path, args.nsamples)
+    print(args.nsamples)
     if args.prune_type == 'sequential':
         return prune_sequential(args, model, tokenizer, pixel_data, generation_config, prompt)
     elif args.prune_type == 'parrallel':
@@ -81,15 +113,15 @@ def prune(args, model, tokenizer, generation_config, img_path, prompt):
             
 def prune_sequential(args, model, tokenizer, pixel_data, generation_config, prompt):
     with torch.no_grad():
-        inputs = prepare_calib_inputs(model, tokenizer, pixel_data, generation_config, prompt)
-    model.config.llm_config.use_cache = False
+        inputs = prepare_calib_inputs(args, model, tokenizer, pixel_data, generation_config, prompt)
+
     llm_layer = model.language_model.model.layers
     _prune_sequential(args, llm_layer, inputs)
 
 def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prompt):
     keep_indices = []
     prune_indices = []
-    llm_layers = model.language_model.model.layers
+    llm_layers = model.model.layers
     wrapped_layers = defaultdict(dict)
     for i, layers in enumerate(llm_layers):
         sub_layers = find_sub_layers(layers)
@@ -99,7 +131,7 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
     def hook_io(i, sub_layer):
         def tmp(_, input, output):
             # if i == 0 and sub_layer == 'mlp.down_proj':
-                # print(f"Hook called for layer {i}/{sub_layer}. Input shape: {input[0].shape}")
+            #     print(f"Hook called for layer {i}/{sub_layer}. Input shape: {input[0].shape}")
             if input[0].shape[1] == 1:
                 wrapped_layers[i][sub_layer].add_batch(input[0].data, output.data)
         return tmp
@@ -114,12 +146,15 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
     with torch.no_grad():
         for pixel_values in tqdm(pixel_data):
             try:
-                model.chat(tokenizer, pixel_values, prompt, generation_config)
-            # except Exception as e:
-            #         print(f"An error occurred: {e}")
-            #         import traceback
-            #         traceback.print_exc()
-            #         continue
+                messages = [{"role": "user", "content": f"{pixel_values}"}]
+                text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+                # input_ids = tokenizer(text_prompt, return_tensors='pt').input_ids.to(model.device)
+                model.generate(**model_inputs, max_new_tokens=32)
             except:
                 continue
 
@@ -152,7 +187,7 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             # wanda = norm_value(wanda)
 
             if args.method == 'magent':
-                imp = (1-args.alpha/10) * norm_value(wanda) + args.alpha/10 * norm_value(entropy[i])            
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])            
 
             if args.method == 'test':
                 imp = wanda * norm_value(entropy[i])    
@@ -163,11 +198,11 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
 
             if args.plot_wanda_ent and args.method == 'magent':
-                sort_wanda = torch.sort(norm_value(wanda), dim=0, stable=True)
+                sort_wanda = torch.sort(wanda, dim=0, stable=True)
                 sort_ent = torch.sort(norm_value(entropy[i]), dim=0, stable=True)
                 indice_wanda = sort_wanda.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
                 indice_ent = sort_ent.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
-                plot_wanda_ent(norm_value(wanda), norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
+                plot_wanda_ent(wanda, norm_value(entropy[i]), layer_idx=i, wanda_idx=indice_wanda, ent_idx=indice_ent, mag_ent_idx=indice, pr=args.prune_ratio, a=args.alpha)
 
             prune_indices.append(indice)
             for sub_layer in sub_layers:
@@ -183,32 +218,17 @@ def _prune_parrallel(args, model, tokenizer, pixel_data, generation_config, prom
             keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
 
             del imp, weights, x_norm_l2, sort_res, indice, W_mask
-    else:
-        for i, layers in tqdm(enumerate(llm_layers)):
-            sub_layers = find_sub_layers(layers)
-            imp = 0
-            wanda = 0
-            for sub_layer in sub_layers:
-                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                x_norm_l2 = torch.sqrt(wrapped_layers[i][sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-                wanda = weights * x_norm_l2  
-
-                W_mask = (torch.zeros_like(wanda) == 1)
-                sort_res = torch.sort(wanda, dim=-1, stable=True)
-                indices = sort_res[1][:,:int(wanda.shape[1]*(args.prune_ratio/10))]
-                W_mask.scatter_(1, indices, True)
-
-                sub_layers[sub_layer].weight.data[W_mask]=0
     
     torch.cuda.empty_cache()
 
     return keep_indices, prune_indices
 
 def _prune_sequential(args, layers, inputs):
+    entropy = None
     keep_indices = []
     prune_indices = []
 
-    for i in tqdm(range(len(layers))):
+    for i in range(len(layers)):
         layer = layers[i]
         sub_layers = find_sub_layers(layer)
 
@@ -229,54 +249,117 @@ def _prune_sequential(args, layers, inputs):
         with torch.no_grad():
             for s in range(len(inputs)):
                 if args.hook_type == 'prefill':
-                    inputs[s].pop('i', None)
-                    _ = layer(**inputs[s])[0]
+                    _ = layer(**inputs[s]['prefill'])[0]
+                elif args.hook_type == 'generate':
+                    # n = len(inputs[s]['generate'])
+                    _ = layer(**inputs[s]['generate'][0])[0]
 
         for h in handles:
             h.remove()
 
+        if args.method in ['entropy', 'magent', 'esparse']:
+            if args.hook_type == 'prefill':
+                wrapped_layers['mlp.down_proj'].prepare_for_hist()
+            elif args.hook_type == 'generate':
+                wrapped_layers['mlp.down_proj'].prepare_for_kde()
+            handles = []
+            handles.append(sub_layers['mlp.down_proj'].register_forward_hook(hook_io('mlp.down_proj')))
+            with torch.no_grad():
+                for s in tqdm(range(len(inputs))):
+                    _ = layer(**inputs[s])[0]
+            for h in handles:
+                h.remove()
+            if args.hook_type == 'prefill':
+                entropy = wrapped_layers['mlp.down_proj'].calculate_entropy()
+            elif args.hook_type == 'generate':
+                entropy = wrapped_layers['mlp.down_proj'].calculate_entropy_kde()
+
+        imp = 0
+        wanda = 0
         if args.structure_prune:
-            pass
-        else:
-            if args.method == 'wanda':
-                for sub_layer in sub_layers:
-                    weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
-                    x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
-                    wanda = weights * x_norm_l2  
+            for sub_layer in sub_layers:
+                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                
+                if args.method == 'entropy':
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                    continue
+                else:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
 
-                    W_mask = (torch.zeros_like(wanda) == 1)
-                    sort_res = torch.sort(wanda, dim=-1, stable=True)
-                    indices = sort_res[1][:,:int(wanda.shape[1]*(args.prune_ratio/10))]
-                    W_mask.scatter_(1, indices, True)
+            wanda = norm_value(wanda)
 
-                    sub_layers[sub_layer].weight.data[W_mask]=0
-            elif args.method == 'group_wanda':
-                wanda = 0
-                for sub_layer in sub_layers:
-                    weight = torch.abs(sub_layers[sub_layer].weight.data)
-                    act = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1)))
-                    if 'up' in sub_layer or 'gate' in sub_layer:
-                        wanda += act.t()*weight.t()
-                    elif 'down' in sub_layer: 
-                        wanda += weight*act
-                    
-                W_metric = wanda.sum(dim=0)
-                W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            if args.method == 'magent':
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])                
 
-                sort_res = torch.sort(W_metric, dim=0, stable=True)
-                # unstructured pruning
-                indices = sort_res.indices[:int(W_metric.shape[0]*(args.prune_ratio/10))]
-                for sub_layer in sub_layers:
-                    W_mask.scatter_(0, indices, True)
-                    if 'up' in sub_layer or 'gate' in sub_layer:
-                        sub_layers[sub_layer].weight.data[W_mask,:]=0
-                    elif 'down' in sub_layer:
-                        sub_layers[sub_layer].weight.data[:,W_mask]=0
+            W_mask = (torch.zeros_like(imp) == 1)
+
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+            prune_indices.append(indice)
+            for sub_layer in sub_layers:
+                # print(f'Prunning {i}.{sub_layer}') 
+                W_mask.scatter_(0, indice, True)
+                if 'up' in sub_layer or 'gate' in sub_layer:
+                    sub_layers[sub_layer].weight.data[W_mask,:]=0
+                elif 'down' in sub_layer:
+                    sub_layers[sub_layer].weight.data[:,W_mask]=0
+                else:
+                    raise ValueError
+
+            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
+
+            del imp, weights, x_norm_l2, sort_res, indice, W_mask
 
             with torch.no_grad():
                 for j in range(len(inputs)):
                     if args.hook_type == 'prefill':
-                        inputs[j]['hidden_states'] = layer(**inputs[j])[0]
+                        inputs[j]['hidden_states'] = layer(**inputs[j]['prefill'])[0]
+                    elif args.hook_type == 'generate':
+                        inputs[j]['hidden_states'][-1] = layer(**inputs[j]['generate'][-1])[0]
+        else:
+            for sub_layer in sub_layers:
+                weights =  torch.abs(sub_layers[sub_layer].weight.data)  # (out, in)
+                x_norm_l2 = torch.sqrt(wrapped_layers[sub_layer].x_norm_l2.reshape((1,-1))) #(1, in)
+                wanda += get_importance('group_wanda', sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                
+                if args.method == 'entropy':
+                    imp = get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10)
+                    continue
+                else:
+                    imp += get_importance(args.method, sub_layer, weights, x_norm_l2, entropy[i], alpha=args.alpha/10) # (1, in)  
+
+            wanda = norm_value(wanda)
+
+            if args.method == 'magent':
+                imp = (1-args.alpha/10) * wanda + args.alpha/10 * norm_value(entropy[i])                
+
+            W_mask = (torch.zeros_like(imp) == 1)
+
+            sort_res = torch.sort(imp, dim=0, stable=True)    # sort along row
+            indice = sort_res.indices[:int(imp.shape[0]*(args.prune_ratio/10))]
+            prune_indices.append(indice)
+            for sub_layer in sub_layers:
+                # print(f'Prunning {i}.{sub_layer}') 
+                W_mask.scatter_(0, indice, True)
+                if 'up' in sub_layer or 'gate' in sub_layer:
+                    sub_layers[sub_layer].weight.data[W_mask,:]=0
+                elif 'down' in sub_layer:
+                    sub_layers[sub_layer].weight.data[:,W_mask]=0
+                else:
+                    raise ValueError
+
+            keep_indices.append(sort_res.indices[int(imp.shape[0]*(args.prune_ratio/10)):])
+
+            del imp, weights, x_norm_l2, sort_res, indice, W_mask
+
+            with torch.no_grad():
+                for j in range(len(inputs)):
+                    if args.hook_type == 'prefill':
+                        inputs[j]['hidden_states'] = layer(**inputs[j]['prefill'])[0]
+                    elif args.hook_type == 'generate':
+                        inputs[j]['hidden_states'][-1] = layer(**inputs[j]['generate'][-1])[0]
     
     torch.cuda.empty_cache()
 
@@ -308,7 +391,7 @@ def apply_channel_prune(model, idx):
     all_down_linears = []
     all_up_linears = []
     all_gate_linears = []
-    for i, decoder_layer in enumerate(model.language_model.model.layers):
+    for i, decoder_layer in enumerate(model.model.layers):
         for name, module in decoder_layer.named_modules():
             if isinstance(module, nn.Linear) and 'down' in name:
                 all_down_linears.append((f"layer.{i}.{name}", module))
@@ -329,13 +412,13 @@ def apply_channel_prune(model, idx):
             new_down_linear = prune_linear_channel(cur_down_linear, idx[i_linear].to(model.device), 1)
             new_gate_linear = prune_linear_channel(cur_gate_linear, idx[i_linear].to(model.device), 0)
             new_up_linear = prune_linear_channel(cur_up_linear, idx[i_linear].to(model.device), 0)
-            model.language_model.model.layers[i_linear].mlp.down_proj = new_down_linear
-            model.language_model.model.layers[i_linear].mlp.gate_proj = new_gate_linear
-            model.language_model.model.layers[i_linear].mlp.up_proj = new_up_linear
+            model.model.layers[i_linear].mlp.down_proj = new_down_linear
+            model.model.layers[i_linear].mlp.gate_proj = new_gate_linear
+            model.model.layers[i_linear].mlp.up_proj = new_up_linear
 
     return model
 
-def copy_all_files(src_dir, dst_dir):
+def copy_all_files(args, src_dir, dst_dir):
     """
     Copy all files from src_dir to dst_dir.
 
@@ -347,6 +430,12 @@ def copy_all_files(src_dir, dst_dir):
 
     for filename in os.listdir(src_dir):
         src_file = os.path.join(src_dir, filename)
+        # if filename == 'config.json':
+        #     with open(src_file, 'r') as f:
+        #         config_data = json.load(f)
+        #     config_data["intermediate_size"] = args.intermediate_size
+            
+
         dst_file = os.path.join(dst_dir, filename)
 
         if os.path.isfile(src_file):
@@ -355,10 +444,11 @@ def copy_all_files(src_dir, dst_dir):
 
 def main():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-14B')
+    ic(model)
     prompt = load_prompt('/data/template.yaml', prompt_type)
     generation_config = dict(max_new_tokens=1024, do_sample=False)
-    img_path = '/data/Dataset/filtered/tagbar'
+    img_path = '/data/alpaca_data_cleaned.json'
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--hook_type', type=str, default='prefill')
@@ -367,77 +457,66 @@ def main():
     parser.add_argument('--prune_ratio', type=int, default=1)
     parser.add_argument('--nsamples', type=int, default=30)
     parser.add_argument('--alpha', type=int, default=1)
+    parser.add_argument('--kde_nsamples', type=int, default=60)
     parser.add_argument('--save_path', type=str, default='./')
     args = parser.parse_args()
     
     args.structure_prune = True
     args.plot_wanda_ent = False
-    args.kde_nsamples = 60
 
     keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     prune_model = apply_channel_prune(model, keep_indices)
-    prune_model.config.llm_config.intermediate_size = prune_model.language_model.model.layers[0].mlp.down_proj.in_features
+    prune_model.config.intermediate_size = prune_model.model.layers[0].mlp.down_proj.in_features
     prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
     prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
-    prune
-    copy_all_files('/data/base_model/base2B', dst_dir=args.save_path)
+
+    copy_all_files(args, '/data/base_model/baseQwen3-14B', dst_dir=args.save_path)
     prune_model.save_pretrained(args.save_path)
     print(f"Pruned model saved to {args.save_path}")
 
 def debug():
     prompt_type = 'base'
-    model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/Tagbar_2B_ver_20250619FVOB')
-    # model, tokenizer = load_model_tokenizer(f'/data/zige.wang/deploy/InternVL3_9B_ver_20250610FVOB')
+    model, tokenizer = load_model_tokenizer(f'/data/base_model/Qwen/Qwen3-14B')
     prompt = load_prompt('/data/template.yaml', prompt_type)
-    generation_config = dict(max_new_tokens=256, do_sample=False)
+    generation_config = dict(max_new_tokens=1024, do_sample=False)
     img_path = '/data/Dataset/filtered/tagbar'
+    img_path = '/data/alpaca_data_cleaned.json'
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
-    args.hook_type = 'prefill'
-    # args.hook_type = 'generate'
-    args.prune_type = 'sequential'
-    # args.prune_type = 'parrallel'
-    args.method = 'wanda'
-    args.structure_prune = False
-    args.prune_ratio = 7
-    args.nsamples = 32
-    args.alpha = 8
-    args.plot_wanda_ent = True
+    # args.hook_type = 'prefill'
+    args.hook_type = 'generate'
+    # args.prune_type = 'sequential'
+    args.prune_type = 'parrallel'
+    args.method = 'group_wanda'
+    args.structure_prune = True
+    args.prune_ratio = 3
+    args.nsamples = 1
+    args.alpha = 1
+    args.plot_wanda_ent = False
     args.kde_nsamples = 60
 
     assert args.method in ['weight', 'wanda', 'entropy', 'esparse', 'magent', 'group_wanda', 'test']
 
     print(f'>>> Running: prune_ratio={args.prune_ratio}0%, method={args.method}, nsamples={args.nsamples}, entropy_ratio={args.alpha}0%')
 
-    if not args.structure_prune:
-        save_path = f'/data/prune/internvl2B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_uns'
-        prune(args, model, tokenizer, generation_config, img_path, prompt)
-        
-    else:
-        # save_path = f'/data/prune/sample/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_s{args.nsamples}'
-        save_path = f'/data/prune/internvl2B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_a{args.alpha}_s{args.nsamples}_k{args.kde_nsamples}'
-        keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
-        prune_model = apply_channel_prune(model, keep_indices)
+    save_path = f'/data/prune/Qwen3-14B/{args.method}_{args.hook_type}_{args.prune_type}_r{args.prune_ratio}_n{args.nsamples}_a{args.alpha}_k{args.kde_nsamples}'
+    
+    keep_indices, prune_indices = prune(args, model, tokenizer, generation_config, img_path, prompt)
     # torch.save(torch.stack(prune_indices), f'./pt/{args.method}_{args.nsamples}_{args.prune_ratio}.pt')
-
-   
-
-    prune_model_size = get_model_size(model, count_nonzero_only=True)
+    
+    prune_model = apply_channel_prune(model, keep_indices)
+    prune_model.config.intermediate_size = prune_model.model.layers[0].mlp.down_proj.in_features
+    prune_model_size = get_model_size(prune_model, count_nonzero_only=True)
     print(f"Prune model has size={prune_model_size/MiB:.2f} MiB")
-    prune_model_params = get_num_parameters(model, count_nonzero_only=True)
+    prune_model_params = get_num_parameters(prune_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
-    copy_all_files('/data/base_model/base2B', dst_dir=save_path)
-    if not args.structure_prune:
-        model.save_pretrained(save_path)
-    else:
-        prune_model.save_pretrained(save_path)
-        ic(prune_model.language_model.model.layers[0].mlp)
+    copy_all_files(args, '/data/base_model/baseQwen3-14B', dst_dir=save_path)
+    prune_model.save_pretrained(save_path)
     print(f"Pruned model saved to {save_path}")
-
 if __name__ == "__main__":
     # debug()
     main()

@@ -54,7 +54,7 @@ run_python_command () {
 #     done
 # done
 
-for method in "${methods1[@]}"; do
+for method in "${methods2[@]}"; do
     for prune_ratio in "${prune_ratios[@]}"; do
         for alpha in "${alphas1[@]}"; do
             run_python_command "$prune_ratio" "$method" "$nsamples" "$alpha"

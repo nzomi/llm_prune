@@ -152,10 +152,11 @@ class WrappedLayer:
             return torch.tensor(entropy, dtype=values.dtype, device=values.device)
 
         input_tensor = torch.stack(self.input_list)
-        N = input_tensor.shape[0]
+        # N = input_tensor.shape[0]
         # print(self.kde_samples, N)
-        indices = torch.randperm(N)[:self.kde_samples]
-        subset = input_tensor[indices]
+        # indices = torch.randperm(N)[:self.kde_samples]
+        # subset = input_tensor[indices]
+        subset = input_tensor[:self.kde_samples]
         # subset = input_tensor
         if self.layer_id == 0:
             print('ent tensor', subset.shape)
