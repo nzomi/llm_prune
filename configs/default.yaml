@@ -1,0 +1,36 @@
+# Default configuration for LLM pruning
+
+# Model settings
+model:
+  type: "internvl"  # internvl, 9b, qwen
+  path: "/path/to/model"
+  
+# Pruning settings
+pruning:
+  method: "group_wanda"  # weight, wanda, group_wanda, entropy, esparse, magent
+  sparsity_ratio: 0.5
+  prune_type: "parrallel"  # sequential, parrallel
+  structure_prune: false
+  alpha: 1.0
+  
+# Data settings
+data:
+  img_path: "/path/to/images"
+  prompt_path: "/path/to/prompt.yaml"
+  nsamples: 40
+  kde_nsamples: 30
+  
+# Output settings
+output:
+  save_path: "/path/to/output"
+  eval_ppl: false
+  
+# Hardware settings
+hardware:
+  cuda_device: "0"
+  
+# Generation settings
+generation:
+  max_new_tokens: 512
+  do_sample: false
+  hook_type: "prefill"  # for qwen model
