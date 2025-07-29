@@ -1,7 +1,7 @@
 import torch
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoModel, AutoTokenizer, AutoConfig, AutoModelForCausalLM
 import torchvision.transforms as T
 import yaml
 import math
@@ -38,22 +38,18 @@ def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbna
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
-    # calculate the existing image aspect ratio
     target_ratios = set(
         (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
         i * j <= max_num and i * j >= min_num)
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
 
-    # find the closest aspect ratio to the target
     target_aspect_ratio = find_closest_aspect_ratio(
         aspect_ratio, target_ratios, orig_width, orig_height, image_size)
 
-    # calculate the target width and height
     target_width = image_size * target_aspect_ratio[0]
     target_height = image_size * target_aspect_ratio[1]
     blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
 
-    # resize the image
     resized_img = image.resize((target_width, target_height))
     processed_images = []
     for i in range(blocks):
@@ -63,7 +59,6 @@ def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbna
             ((i % (target_width // image_size)) + 1) * image_size,
             ((i // (target_width // image_size)) + 1) * image_size
         )
-        # split the image
         split_img = resized_img.crop(box)
         processed_images.append(split_img)
     assert len(processed_images) == blocks
@@ -80,12 +75,16 @@ def load_image(image_file, input_size=448, max_num=12):
     pixel_values = torch.stack(pixel_values)
     return pixel_values
 
-def split_model(model_path):
+def split_model(model_path, model_type='internvl'):
     device_map = {}
     world_size = torch.cuda.device_count()
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    num_layers = config.llm_config.num_hidden_layers
-    # Since the first GPU will be used for ViT, treat it as half a GPU.
+    
+    if model_type == 'qwen':
+        num_layers = config.num_hidden_layers
+    else:
+        num_layers = config.llm_config.num_hidden_layers
+    
     num_layers_per_gpu = math.ceil(num_layers / (world_size - 0.5))
     num_layers_per_gpu = [num_layers_per_gpu] * world_size
     num_layers_per_gpu[0] = math.ceil(num_layers_per_gpu[0] * 0.5)
@@ -106,22 +105,35 @@ def split_model(model_path):
 
     return device_map
 
-def load_model_tokenizer(path):
-    device_map = split_model(path)
-    model = AutoModel.from_pretrained(
-        path,
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=False,
-        low_cpu_mem_usage=True,
-        use_flash_attn=False,
-        trust_remote_code=True,
-        device_map='auto').eval()
+def load_model_tokenizer(path, model_type='internvl'):
+    if model_type == 'qwen':
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=False,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map='auto').eval()
+    else:
+        device_map = split_model(path, model_type)
+        model = AutoModel.from_pretrained(
+            path,
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=False,
+            low_cpu_mem_usage=True,
+            use_flash_attn=False,
+            trust_remote_code=True,
+            device_map='auto').eval()
+    
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
     return model, tokenizer
 
-def load_prompt(yaml_path, prompt_type='json'):
+def load_prompt(yaml_path, prompt_type='json', model_type='internvl'):
     with open(yaml_path, 'r', encoding='utf-8') as f:
         yamlfile = yaml.load(f, Loader=yaml.FullLoader)
 
-    prompt = yamlfile[prompt_type]
+    if model_type == '9b':
+        prompt = yamlfile['qa_template']['allInfo']['prompt']
+    else:
+        prompt = yamlfile[prompt_type]
     return prompt
